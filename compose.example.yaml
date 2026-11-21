@@ -1,0 +1,54 @@
+services:
+  drydock:
+    image: drydock:latest
+    container_name: drydock
+    restart: unless-stopped
+    # Hardening: read-only root filesystem, no capabilities, no privilege
+    # escalation, bounded resources. Drydock only needs outbound HTTPS.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 64
+    environment:
+      PORTAINER_URL: https://portainer:9443
+      # Portainer's self-signed certificate (or its CA), mounted below.
+      # PORTAINER_INSECURE: "true" also works but lets the API key be intercepted.
+      PORTAINER_CA_FILE: /certs/portainer.pem
+      PANGOLIN_URL: https://pangolin.example.com/integration/v1
+      PANGOLIN_ORG_ID: ${PANGOLIN_ORG_ID}
+      # Secrets are read from files, so they do not show up in `docker inspect`.
+      PORTAINER_API_KEY_FILE: /run/secrets/portainer_api_key
+      PANGOLIN_API_KEY_FILE: /run/secrets/pangolin_api_key
+      # Required (user:password). Behind Pangolin SSO only, use instead:
+      # UI_AUTH_DISABLED: "true" and ALLOWED_HOSTS: drydock.example.com
+      UI_BASIC_AUTH_FILE: /run/secrets/drydock_ui_auth
+    secrets:
+      - portainer_api_key
+      - pangolin_api_key
+      - drydock_ui_auth
+    volumes:
+      - ./portainer.pem:/certs/portainer.pem:ro
+    # Defined here too so it works whatever built the image: Podman builds
+    # OCI images by default, and OCI images drop the Dockerfile HEALTHCHECK.
+    healthcheck:
+      test: ["CMD", "/drydock", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    labels:
+      drydock.ignore: "true"
+
+# Without Swarm, secrets are bind-mounted files: they must be readable by
+# uid 65534 (e.g. `chmod 0444`), keep them in a directory only root can list.
+secrets:
+  portainer_api_key:
+    file: ./secrets/portainer_api_key
+  pangolin_api_key:
+    file: ./secrets/pangolin_api_key
+  drydock_ui_auth:
+    file: ./secrets/drydock_ui_auth

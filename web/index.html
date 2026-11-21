@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drydock</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --fg: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+  --ok: #1f8a4c; --ok-bg: #e6f5ec; --warn: #9a6400; --warn-bg: #fff4dc;
+  --bad: #b42318; --bad-bg: #fde8e6; --info: #2457c5; --info-bg: #e7eefc;
+  --btn: #2457c5; --btn-fg: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151c; --card: #1a1f29; --fg: #e5e8ef; --muted: #8b93a6; --line: #2a3140;
+    --ok: #5fd08f; --ok-bg: #173226; --warn: #f0b952; --warn-bg: #362a12;
+    --bad: #ff8a7f; --bad-bg: #3a1a18; --info: #8fb0ff; --info-bg: #1b2643;
+    --btn: #4a7bf0;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--card); position: sticky; top: 0; z-index: 2; }
+h1 { font-size: 18px; margin: 0; }
+.meta { color: var(--muted); font-size: 13px; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
+.filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+.chip { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; }
+.chip[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; overflow: hidden; }
+.card-head { display: flex; gap: 12px; align-items: center; padding: 12px 16px; flex-wrap: wrap; }
+.card-head h2 { font-size: 16px; margin: 0; flex: 1 1 auto; min-width: 120px; }
+.badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 6px; white-space: nowrap; }
+.b-ok { color: var(--ok); background: var(--ok-bg); }
+.b-warn { color: var(--warn); background: var(--warn-bg); }
+.b-bad { color: var(--bad); background: var(--bad-bg); }
+.b-info { color: var(--info); background: var(--info-bg); }
+.b-muted { color: var(--muted); background: var(--bg); }
+button.primary, button.danger, button.ghost { font: inherit; font-weight: 600; border-radius: 7px; padding: 6px 14px; cursor: pointer; border: 1px solid transparent; }
+button.primary { background: var(--btn); color: var(--btn-fg); }
+button.danger { background: var(--bad-bg); color: var(--bad); border-color: var(--bad); }
+button.ghost { background: transparent; color: var(--fg); border-color: var(--line); }
+button:disabled { opacity: .55; cursor: default; }
+.body { border-top: 1px solid var(--line); padding: 10px 16px 14px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+tr:last-child td { border-bottom: 0; }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.note { color: var(--muted); font-size: 12px; }
+.res { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.errors { color: var(--bad); font-size: 12px; margin-top: 8px; }
+.log { background: var(--bg); border-radius: 8px; padding: 8px 10px; margin-top: 10px; font: 12px ui-monospace, monospace; max-height: 220px; overflow: auto; }
+.log div { white-space: pre-wrap; }
+details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 8px; }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+.tw { overflow-x: auto; }
+@media (max-width: 640px) { .hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Drydock</h1>
+    <div class="meta" id="meta">Chargement…</div>
+  </div>
+  <button class="ghost" id="scan">Rechercher les mises à jour</button>
+</header>
+<main>
+  <div class="filters" id="filters"></div>
+  <div id="global-error" class="errors"></div>
+  <div id="list"><div class="empty">Chargement…</div></div>
+</main>
+<script>
+const STATUS = {
+  updatable:       ["Mise à jour disponible", "b-info"],
+  breaking:        ["Mise à jour majeure", "b-bad"],
+  major_available: ["Version majeure disponible", "b-warn"],
+  disabled:        ["Mises à jour désactivées", "b-muted"],
+  self_stack:      ["Stack de Drydock", "b-muted"],
+  up_to_date:      ["À jour", "b-ok"],
+  inactive:        ["Inactive", "b-muted"],
+  unsupported:     ["Non gérée", "b-muted"],
+  error:           ["Erreur", "b-bad"],
+};
+const SEV = {
+  patch: ["Patch", "b-ok"], minor: ["Mineure", "b-info"],
+  major: ["Majeure", "b-bad"], unknown: ["Inconnue", "b-warn"],
+};
+const FILTERS = [["all", "Toutes"], ["updates", "Avec mises à jour"], ["up_to_date", "À jour"], ["other", "Autres"]];
+let filter = "updates";
+try { filter = localStorage.getItem("filter") || filter; } catch {}
+let state = null;
+const open = new Set();
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ago = t => {
+  if (!t) return "jamais";
+  const s = Math.floor(Date.now() / 1000) - t;
+  if (s < 60) return "à l'instant";
+  if (s < 3600) return `il y a ${Math.floor(s / 60)} min`;
+  if (s < 86400) return `il y a ${Math.floor(s / 3600)} h`;
+  return new Date(t * 1000).toLocaleString("fr-FR");
+};
+const time = t => new Date(t * 1000).toLocaleTimeString("fr-FR");
+
+function matches(s) {
+  if (filter === "all") return true;
+  if (filter === "updates") return ["updatable", "breaking", "major_available", "disabled"].includes(s.status);
+  if (filter === "up_to_date") return s.status === "up_to_date";
+  return ["inactive", "unsupported", "error", "self_stack"].includes(s.status);
+}
+
+function renderFilters() {
+  const counts = { all: state.stacks.length };
+  for (const [k] of FILTERS.slice(1)) { const f = filter; filter = k; counts[k] = state.stacks.filter(matches).length; filter = f; }
+  document.getElementById("filters").innerHTML = FILTERS.map(([k, l]) =>
+    `<button class="chip" data-f="${k}" aria-pressed="${k === filter}">${l} (${counts[k]})</button>`).join("");
+}
+
+function version(u) {
+  if (u.kind === "tag") return `<code>${esc(u.current_tag)}</code> → <code>${esc(u.target_tag)}</code>`;
+  const a = u.current_version, b = u.new_version;
+  const v = a && b && a !== b ? `<br><span class="note">${esc(a)} → ${esc(b)}</span>` : "";
+  return `<code>${esc(u.current_tag)}</code> (nouvelle image)${v}`;
+}
+
+function jobFor(id) { return state.jobs.find(j => j.stack_id === id); }
+
+function renderStack(s) {
+  const [label, cls] = STATUS[s.status] || [s.status, "b-muted"];
+  const job = jobFor(s.id);
+  const running = job && job.status === "running";
+  const pangolinBlocked = s.can_update && (state.pangolin_error || s.pangolin_errors.length);
+  let action = "";
+  if (running) action = `<button class="primary" disabled>Mise à jour…</button>`;
+  else if (pangolinBlocked) action = `<button class="primary" disabled title="La maintenance ne pourrait pas être activée">Pangolin inaccessible</button>`;
+  else if (s.can_update && s.needs_force) action = `<button class="danger" data-update="${s.id}" data-force="1">Forcer la mise à jour</button>`;
+  else if (s.can_update) action = `<button class="primary" data-update="${s.id}">Update Stack</button>`;
+
+  const n = s.updates.length;
+  const expanded = open.has(s.id) || running || (n > 0 && !open.has(-s.id));
+  const rows = s.updates.map(u => {
+    const [sl, sc] = SEV[u.severity] || [u.severity, "b-muted"];
+    const apply = u.disabled ? "Désactivé" : u.auto ? (u.breaking ? "Avec confirmation" : "Oui") : "Manuel";
+    return `<tr>
+      <td>${esc(u.services.join(", "))}</td>
+      <td class="hide-sm"><code>${esc(u.image)}</code></td>
+      <td>${version(u)}${u.note ? `<div class="note">${esc(u.note)}</div>` : ""}</td>
+      <td><span class="badge ${sc}">${sl}</span></td>
+      <td>${apply}</td></tr>`;
+  }).join("");
+  const table = n ? `<div class="tw"><table><thead><tr><th>Service</th><th class="hide-sm">Image</th><th>Version</th><th>Type</th><th>Auto</th></tr></thead><tbody>${rows}</tbody></table></div>` : "";
+
+  const live = s.status !== "inactive" && s.status !== "unsupported";
+  let res = "";
+  if (state.pangolin && s.resources.length)
+    res = `<div class="res">Pangolin : ${s.resources.map(r => `<span class="badge ${r.maintenance ? "b-warn" : "b-muted"}">${esc(r.name || r.full_domain)}${r.maintenance ? " · maintenance" : ""}</span>`).join("")}</div>`;
+  else if (state.pangolin && live)
+    res = `<div class="res">${state.pangolin_error ? "Ressources Pangolin inconnues (Pangolin inaccessible)" : "Aucune ressource Pangolin liée"}</div>`;
+  if (s.pangolin_errors.length)
+    res += `<div class="errors">${s.pangolin_errors.map(esc).join("<br>")}</div>`;
+
+  const services = s.services.length ? `<details><summary>${s.services.length} conteneur(s)</summary><div class="tw"><table><tbody>${
+    s.services.map(c => `<tr><td>${esc(c.service)}</td><td class="hide-sm"><code>${esc(c.image)}</code></td><td>${esc(c.status)}</td></tr>`).join("")
+  }</tbody></table></div></details>` : "";
+
+  const errors = s.errors.length ? `<div class="errors">${s.errors.map(esc).join("<br>")}</div>` : "";
+  const log = job ? `<div class="log">${job.log.map(l => `<div>${time(l.at)}  ${esc(l.msg)}</div>`).join("")}</div>` : "";
+  const jobBadge = job && !running ? `<span class="badge ${job.status === "success" ? "b-ok" : "b-bad"}">${job.status === "success" ? "Dernière MAJ réussie" : "Dernière MAJ échouée"}</span>` : "";
+
+  return `<section class="card">
+    <div class="card-head">
+      <h2>${esc(s.name)}${s.git ? ` <span class="badge b-muted">Git</span>` : ""}</h2>
+      ${jobBadge}
+      <span class="badge ${cls}">${label}${n ? ` · ${n}` : ""}</span>
+      ${action}
+      <button class="ghost" data-toggle="${s.id}" aria-label="Détails">${expanded ? "▴" : "▾"}</button>
+    </div>
+    ${expanded ? `<div class="body">${table}${res}${errors}${services}${log}</div>` : ""}
+  </section>`;
+}
+
+function render() {
+  if (!state) return;
+  document.getElementById("meta").textContent = state.scanning
+    ? "Analyse en cours…"
+    : `Dernière analyse : ${ago(state.last_scan)}`;
+  document.getElementById("scan").disabled = state.scanning;
+  document.getElementById("global-error").innerHTML = [
+    state.last_error && `Erreur : ${esc(state.last_error)}`,
+    state.pangolin_error && `Pangolin : ${esc(state.pangolin_error)}<br>Les mises à jour sont bloquées, car la maintenance ne pourrait pas être activée.`,
+  ].filter(Boolean).join("<br><br>");
+  renderFilters();
+  const list = state.stacks.filter(matches);
+  document.getElementById("list").innerHTML = list.length
+    ? list.map(renderStack).join("")
+    : `<div class="empty">${state.scanning && !state.last_scan ? "Première analyse en cours…" : "Aucune stack dans cette catégorie"}</div>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch("api/state");
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json();
+    render();
+  } catch (e) {
+    document.getElementById("meta").textContent = `Serveur injoignable (${e.message})`;
+  }
+  const busy = state && (state.scanning || state.jobs.some(j => j.status === "running"));
+  setTimeout(load, busy ? 2000 : 15000);
+}
+
+document.addEventListener("click", async e => {
+  const t = e.target.closest("button");
+  if (!t) return;
+  if (t.dataset.f) {
+    filter = t.dataset.f;
+    try { localStorage.setItem("filter", filter); } catch {}
+    render();
+  } else if (t.dataset.toggle) {
+    const id = +t.dataset.toggle;
+    const s = state.stacks.find(x => x.id === id);
+    const defaultOpen = s && s.updates.length > 0;
+    const isOpen = open.has(id) || (defaultOpen && !open.has(-id));
+    open.delete(id); open.delete(-id);
+    if (isOpen && defaultOpen) open.add(-id);
+    else if (!isOpen) open.add(id);
+    render();
+  } else if (t.dataset.update) {
+    const id = +t.dataset.update;
+    const s = state.stacks.find(x => x.id === id);
+    const force = !!t.dataset.force;
+    const majors = s.updates.filter(u => u.auto && u.breaking).map(u => `• ${u.services.join(", ")} : ${u.new_version || u.current_tag}`).join("\n");
+    const unknown = s.updates.some(u => u.auto && u.severity === "unknown");
+    const msg = force
+      ? `La stack « ${s.name} » contient une mise à jour MAJEURE :\n${majors}\n\nElle peut casser le service (migration de données, configuration…). Continuer ?`
+      : `Mettre à jour « ${s.name} » ?${s.resources.length ? "\nLes ressources Pangolin passeront en maintenance pendant l'opération." : ""}${unknown ? "\n\nAttention : certaines images ne publient pas leur version." : ""}`;
+    if (!confirm(msg)) return;
+    t.disabled = true;
+    const r = await fetch(`api/stacks/${id}/update`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force }) });
+    if (!r.ok) alert((await r.json().catch(() => ({}))).error || `Erreur ${r.status}`);
+    open.add(id);
+    load();
+  } else if (t.id === "scan") {
+    t.disabled = true;
+    await fetch("api/scan", { method: "POST" });
+    setTimeout(load, 500);
+  }
+});
+
+load();
+</script>
+</body>
+</html>

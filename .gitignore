@@ -1,0 +1,9 @@
+/target
+# Local CodeGraph index
+/.codegraph/
+# Never commit secrets or certificates
+/secrets/
+*.pem
+*.key
+.env
+*.env

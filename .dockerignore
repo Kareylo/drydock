@@ -1,0 +1,12 @@
+# Only Cargo.toml, Cargo.lock, src/ and web/ are needed to build.
+target
+.git
+.github
+.codegraph
+docs
+# Never send secrets or certificates to the Docker daemon / remote builders
+secrets
+*.pem
+*.key
+.env
+*.env
