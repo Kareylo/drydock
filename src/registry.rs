@@ -186,6 +186,32 @@ fn parse_challenge(h: &str) -> (String, HashMap<String, String>) {
     (scheme.to_lowercase(), map)
 }
 
+/// The registry could not be reached at all (DNS, TCP, TLS: plain-HTTP or
+/// self-signed registry, timeout), as opposed to an HTTP answer such as 401/404.
+pub fn is_unreachable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+        .any(|r| r.is_connect() || r.is_timeout())
+}
+
+/// Explains a 401 that persists after the token negotiation.
+fn unauthorized_hint(img: &ImageRef, has_credentials: bool) -> String {
+    // Name as users write it in REGISTRY_AUTH.
+    let host = if img.host == "registry-1.docker.io" { "docker.io" } else { img.host.as_str() };
+    if has_credentials {
+        format!(
+            "{host}/{}: accès refusé avec les identifiants de REGISTRY_AUTH \
+             (jeton expiré ou sans droit de lecture sur ce dépôt ?)",
+            img.repo
+        )
+    } else {
+        format!(
+            "{host}/{}: accès refusé (image privée ?) : définir REGISTRY_AUTH={host}=utilisateur:jeton",
+            img.repo
+        )
+    }
+}
+
 /// Host part of `host[:port]`.
 fn bare_host(h: &str) -> &str {
     h.rsplit_once(':').map_or(h, |(h, _)| h)
@@ -322,6 +348,9 @@ impl Registry {
             }
             if resp.status() == StatusCode::TOO_MANY_REQUESTS {
                 bail!("{}: rate limited by registry", img.host);
+            }
+            if resp.status() == StatusCode::UNAUTHORIZED {
+                bail!("{}", unauthorized_hint(img, self.auth.contains_key(&img.host)));
             }
             return Ok(resp.error_for_status()?);
         }
@@ -460,6 +489,42 @@ mod tests {
         assert_eq!((r.host.as_str(), r.repo.as_str(), r.tag.as_str()), ("localhost:5000", "app", "1.2"));
 
         assert!(ImageRef::parse("${IMAGE}").is_err());
+    }
+
+    #[tokio::test]
+    async fn unreachable_registries() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let r = Registry::new(HashMap::new(), vec![], vec![]).unwrap();
+        // Nothing listening.
+        let img = ImageRef::parse("127.0.0.1:1/app:1").unwrap();
+        let e = r.tag_digest(&img).await.err().expect("must fail");
+        assert!(is_unreachable(&e), "{e:#}");
+        // Plain-HTTP registry: the TLS handshake fails.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut c in l.incoming().flatten() {
+                let mut b = [0u8; 512];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let img = ImageRef::parse(&format!("127.0.0.1:{port}/app:1")).unwrap();
+        let e = r.tag_digest(&img).await.err().expect("must fail");
+        assert!(is_unreachable(&e), "{e:#}");
+        // An HTTP answer is not "unreachable".
+        let e = anyhow::anyhow!("registry-1.docker.io/x: accès refusé");
+        assert!(!is_unreachable(&e));
+    }
+
+    #[test]
+    fn unauthorized_hints() {
+        let img = ImageRef::parse("docker.io/kareylo/stocky:latest").unwrap();
+        let h = unauthorized_hint(&img, false);
+        assert!(h.contains("REGISTRY_AUTH=docker.io=utilisateur:jeton"), "{h}");
+        assert!(h.starts_with("docker.io/kareylo/stocky"), "{h}");
+        assert!(unauthorized_hint(&img, true).contains("identifiants de REGISTRY_AUTH"));
     }
 
     #[test]

@@ -21,6 +21,16 @@ Une stack est :
 - **Mise à jour majeure** : un tag flottant a changé de version majeure. Comme le pull ne peut pas être évité, le bouton devient **Forcer la mise à jour**, avec une confirmation.
 - **Mise à jour manuelle** : une mise à jour existe, mais Drydock ne peut pas réécrire le tag (stack Git, image définie par une variable). Elle est indiquée, rien n'est appliqué.
 
+### Registres pris en charge
+
+Drydock interroge directement tout registre conforme à l'API OCI Distribution : Docker Hub, GHCR, lscr.io, Quay, GitLab, Gitea/Forgejo, Harbor, ACR, Artifact Registry, `registry:2`… Pour une image privée, ajoute ses identifiants dans `REGISTRY_AUTH` (`docker.io=user:jeton`). Portainer ne transmet pas les siens pour cette vérification. Pour lscr.io, ajoute aussi `REGISTRY_AUTH_REALMS=ghcr.io`.
+
+Si Drydock ne peut pas joindre un registre (registre en HTTP simple, certificat auto-signé, registre accessible seulement depuis le serveur Docker), il demande le digest au Docker du serveur via Portainer. Dans ce cas :
+
+- seules les nouvelles images derrière le même tag sont détectées, car le Docker du serveur ne sait pas lister les tags ;
+- la version n'est pas comparée ;
+- les images privées restent soumises à `REGISTRY_AUTH`.
+
 En semver, une hausse de la version mineure sur une 0.x est considérée comme majeure. Les images qui ne publient pas leur version sont marquées « Inconnue », et une confirmation est demandée.
 
 ## Déroulé d'une mise à jour

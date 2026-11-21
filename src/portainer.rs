@@ -200,6 +200,20 @@ impl Portainer {
         Self::json(self.get(&format!("/endpoints/{endpoint}/docker/images/{image_id}/json"))).await
     }
 
+    /// Digest the tag currently points to, as seen by the environment's Docker
+    /// daemon (`GET /distribution/{name}/json`). Used when Drydock cannot reach
+    /// the registry itself: plain-HTTP or self-signed registries the daemon trusts.
+    /// Portainer does not add its registry credentials here, so private images
+    /// still need REGISTRY_AUTH.
+    pub async fn distribution_digest(&self, endpoint: i64, image: &str) -> Result<String> {
+        let name = image.split('@').next().unwrap_or(image);
+        let v: Value = Self::json(self.get(&format!("/endpoints/{endpoint}/docker/distribution/{name}/json"))).await?;
+        v.pointer("/Descriptor/digest")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("no Descriptor.digest in the distribution response")
+    }
+
     /// Pull one image on the environment (Portainer adds the credentials of the
     /// registries it knows). Docker reports pull errors inside a 200 stream.
     pub async fn pull_image(&self, endpoint: i64, image: &str) -> Result<()> {

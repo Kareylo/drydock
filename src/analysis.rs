@@ -202,8 +202,19 @@ async fn analyse_image(
 
     // 1. Newer tags in the same major (pinned / partially pinned version tags).
     //    Like diun, other majors are never proposed.
-    if tag_shape.is_some() {
-        let tags = state.registry.list_tags(&img).await.context("listing tags")?;
+    // When Drydock cannot reach the registry (plain HTTP, self-signed TLS…),
+    // the environment's Docker daemon answers for the digest instead. It has no
+    // tag-list API, so newer tags cannot be looked up that way.
+    let tags = if tag_shape.is_some() {
+        match state.registry.list_tags(&img).await {
+            Ok(t) => Some(t),
+            Err(e) if crate::registry::is_unreachable(&e) => None,
+            Err(e) => return Err(e.context("listing tags")),
+        }
+    } else {
+        None
+    };
+    if let Some(tags) = tags {
         if let Some((target, severity)) = same_major_candidate(&img.tag, &tags) {
             let pull_ref = compose_image
                 .filter(|_| rewritable)
@@ -235,13 +246,29 @@ async fn analyse_image(
     // 2. Same tag, new digest (skip if a same-major tag bump already covers it).
     let has_safe_tag_bump = updates.iter().any(|u| u.auto);
     if !has_safe_tag_bump {
-        let remote_digest = state.registry.tag_digest(&img).await.context("remote digest")?;
+        let (remote_digest, via_daemon) = match state.registry.tag_digest(&img).await {
+            Ok(d) => (d, false),
+            Err(e) if crate::registry::is_unreachable(&e) => {
+                tracing::debug!("{shown}: registre injoignable ({e:#}), digest demandé au Docker du serveur");
+                let d = state
+                    .portainer
+                    .distribution_digest(stack.endpoint_id, &container.image)
+                    .await
+                    .with_context(|| format!("registre injoignable ({e:#}), et le Docker du serveur n'a pas répondu"))?;
+                (d, true)
+            }
+            Err(e) => return Err(e.context("remote digest")),
+        };
         if remote_digest != local_digest {
-            let new_version = match state.registry.labels(&img, &remote_digest, &platform).await {
-                Ok(l) => version_label(&l),
-                Err(e) => {
-                    tracing::debug!("labels for {shown}: {e:#}");
-                    None
+            let new_version = if via_daemon {
+                None
+            } else {
+                match state.registry.labels(&img, &remote_digest, &platform).await {
+                    Ok(l) => version_label(&l),
+                    Err(e) => {
+                        tracing::debug!("labels for {shown}: {e:#}");
+                        None
+                    }
                 }
             };
             let mut severity = classify_labels(local_version.as_deref(), new_version.as_deref());
@@ -250,6 +277,10 @@ async fn analyse_image(
                 severity = Severity::Patch;
             }
             let note = match severity {
+                _ if via_daemon => Some(
+                    "Registre injoignable par Drydock : nouvelle image vue par le Docker du serveur, version non comparée"
+                        .to_string(),
+                ),
                 Severity::Unknown => Some("Version non publiée par l'image : impact inconnu".to_string()),
                 Severity::Major => Some("Le tag flottant pointe vers une nouvelle version majeure".to_string()),
                 _ => None,
