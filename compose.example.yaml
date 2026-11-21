@@ -3,6 +3,9 @@ services:
     image: drydock:latest
     container_name: drydock
     restart: unless-stopped
+    # User and group the process runs as (default: nobody, 65534). Set PUID/PGID
+    # in the stack environment to match the owner of the secret files.
+    user: "${PUID:-65534}:${PGID:-65534}"
     # Hardening: read-only root filesystem, no capabilities, no privilege
     # escalation, bounded resources. Drydock only needs outbound HTTPS.
     read_only: true
@@ -42,7 +45,7 @@ services:
       - pangolin_api_key
       - drydock_ui_auth
     volumes:
-      - ./portainer.pem:/certs/portainer.pem:ro
+      - /opt/drydock/portainer.pem:/certs/portainer.pem:ro
     # Defined here too so it works whatever built the image: Podman builds
     # OCI images by default, and OCI images drop the Dockerfile HEALTHCHECK.
     healthcheck:
@@ -54,12 +57,15 @@ services:
     labels:
       drydock.ignore: "true"
 
-# Without Swarm, secrets are bind-mounted files: they must be readable by
-# uid 65534 (e.g. `chmod 0444`), keep them in a directory only root can list.
+# Without Swarm, secrets are bind-mounted host files: they must be readable by
+# PUID/PGID, e.g. `chown root:$PGID` + `chmod 0440`. Keep them in a directory
+# only root can list.
+# Use absolute host paths: in a Portainer stack, relative paths resolve inside
+# Portainer's own data directory, not on the host.
 secrets:
   portainer_api_key:
-    file: ./secrets/portainer_api_key
+    file: /opt/drydock/secrets/portainer_api_key
   pangolin_api_key:
-    file: ./secrets/pangolin_api_key
+    file: /opt/drydock/secrets/pangolin_api_key
   drydock_ui_auth:
-    file: ./secrets/drydock_ui_auth
+    file: /opt/drydock/secrets/drydock_ui_auth

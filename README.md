@@ -106,7 +106,7 @@ Le proxy authentifie l'utilisateur, puis ajoute à chaque requête vers Drydock 
 | `PROXY_USER_HEADER` | — | en-tête contenant l'utilisateur authentifié (ex. `Remote-User`). S'il est défini, il devient obligatoire |
 | `PROXY_TRUSTED_IPS` | — | adresses ou réseaux autorisés à joindre Drydock, ex. `172.18.0.0/16` (réseau Docker du proxy). Recommandé |
 
-- **Pangolin :** active l'authentification SSO sur la ressource Drydock, puis ajoute l'en-tête `X-Drydock-Proxy-Secret: <secret>` aux requêtes transmises à Drydock (en-têtes personnalisés de la ressource, si ta version de Pangolin le permet). Vérifie quel en-tête d'identité ta version transmet avant de définir `PROXY_USER_HEADER`.
+- **Pangolin :** sur la ressource Drydock, active le SSO et l'option *forward identity headers*. Ajoute ensuite l'en-tête de requête personnalisé `X-Drydock-Proxy-Secret` avec le secret pour valeur (champ `requestHeaders` de la ressource, objets `{name, value}`). Pangolin transmet l'identité dans `Remote-User` (nom d'utilisateur), `Remote-Email`, `Remote-Name`, `Remote-Role` et `Remote-User-Id`. Badger supprime ces en-têtes s'ils viennent du client, donc ils ne peuvent pas être falsifiés en passant par Pangolin. Utilise `PROXY_USER_HEADER=Remote-User`. Pour `PROXY_TRUSTED_IPS`, indique le réseau Docker de Newt, car c'est Newt qui transmet les requêtes à Drydock.
 - **Authelia + Traefik :** middleware `forwardAuth` vers Authelia (avec `authResponseHeaders: Remote-User`), plus un middleware `headers` dont `customRequestHeaders` ajoute le secret.
 
 ### `oidc` : n'importe quel fournisseur OpenID Connect (Authelia, Authentik, Keycloak…)
@@ -150,6 +150,19 @@ Aucune authentification. Ce mode est réservé au cas où quelque chose d'autre 
 ## Déploiement
 
 Voir [compose.example.yaml](compose.example.yaml).
+
+### Utilisateur et groupe (PUID / PGID)
+
+Par défaut, Drydock tourne en `nobody` (65534:65534). Pour choisir l'utilisateur et le groupe, le compose d'exemple utilise `user: "${PUID:-65534}:${PGID:-65534}"` : définis `PUID` et `PGID` dans les variables d'environnement de la stack (Portainer, `.env`…). Docker applique lui-même ce choix au démarrage. L'image ne contient pas de shell et ne démarre jamais en root, donc rien n'est à changer de ce côté.
+
+Les fichiers de secrets doivent être lisibles par cet utilisateur ou ce groupe :
+
+```bash
+sudo chown root:1000 /opt/drydock/secrets/*   # 1000 = PGID
+sudo chmod 0440 /opt/drydock/secrets/*
+```
+
+Si un secret n'est pas lisible, Drydock s'arrête au démarrage avec `reading /run/secrets/<nom>` (permission refusée).
 
 ### Drydock ne se met jamais à jour lui-même
 
