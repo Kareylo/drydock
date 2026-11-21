@@ -12,14 +12,14 @@ Pour chaque image de chaque stack :
 | Cas | Détection | Type |
 |---|---|---|
 | Tag versionné (`8.34`, `18-alpine`, `v1.2.3`) avec un tag plus récent **dans la même majeure** | liste des tags du registre (même préfixe, même suffixe, même précision) | patch / mineure → appliquée automatiquement (le tag est réécrit dans le compose) |
-| Tag versionné avec une **nouvelle majeure** (`postgres 18 → 19`) | idem | majeure → **jamais appliquée automatiquement**, signalée comme migration manuelle |
-| Tag flottant (`latest`, `latest-alpine`…) qui pointe vers une **nouvelle image** | digest du registre ≠ digest local | sévérité calculée à partir du label `org.opencontainers.image.version` (local vs distant) |
+| Tag versionné avec une **nouvelle majeure** (`postgres:18-alpine` → `19-alpine`) | idem | **jamais proposée**, comme avec diun : une montée de majeure se fait à la main dans le compose |
+| Tag écrit dans le compose (`18-alpine`, `latest`…) qui pointe vers une **nouvelle image** | digest du registre ≠ digest local | sévérité calculée à partir du label `org.opencontainers.image.version` (local vs distant) |
 
 Une stack est :
 
 - **Mise à jour disponible** : bouton **Update Stack**.
 - **Mise à jour majeure** : un tag flottant a changé de version majeure. Comme le pull ne peut pas être évité, le bouton devient **Forcer la mise à jour**, avec une confirmation.
-- **Version majeure disponible** : seule une montée de majeure via un changement de tag est possible. C'est indiqué, mais rien n'est appliqué.
+- **Mise à jour manuelle** : une mise à jour existe, mais Drydock ne peut pas réécrire le tag (stack Git, image définie par une variable). Elle est indiquée, rien n'est appliqué.
 
 En semver, une hausse de la version mineure sur une 0.x est considérée comme majeure. Les images qui ne publient pas leur version sont marquées « Inconnue », et une confirmation est demandée.
 
@@ -59,7 +59,7 @@ Une image partagée par plusieurs services est mise à jour seulement si **tous*
 | `PORTAINER_CA_FILE` | — | certificat PEM à approuver pour Portainer : son autorité, ou son certificat auto-signé s'il n'est pas marqué `CA:TRUE` |
 | `PORTAINER_INSECURE` | `false` | désactive la vérification du certificat (déconseillé : la clé API peut être interceptée). Un avertissement est loggé |
 | `PANGOLIN_URL` | — | ex. `https://pangolin.example.com/integration/v1` |
-| `PANGOLIN_API_KEY` (ou `_FILE`) | — | clé d'intégration avec droits sur les ressources |
+| `PANGOLIN_API_KEY` (ou `_FILE`) | — | clé d'organisation, à créer dans *Organization > Management > API Keys*, avec les droits de lecture et de modification sur les ressources (pas une clé *Server Admin*). Elle n'est affichée qu'une fois |
 | `PANGOLIN_ORG_ID` | — | active la correspondance automatique par domaine |
 | `URL_LABEL` / `RESOURCE_LABEL` / `IGNORE_LABEL` / `ENABLE_LABEL` | `url` / `drydock.pangolin.resource` / `drydock.ignore` / `drydock.enable` | noms des labels |
 | `REQUIRE_ENABLE_LABEL` | `false` | mode opt-in : seuls les services avec `drydock.enable: "true"` sont mis à jour |

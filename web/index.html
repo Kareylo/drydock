@@ -76,7 +76,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-
 const STATUS = {
   updatable:       ["Mise à jour disponible", "b-info"],
   breaking:        ["Mise à jour majeure", "b-bad"],
-  major_available: ["Version majeure disponible", "b-warn"],
+  manual: ["Mise à jour manuelle", "b-warn"],
   disabled:        ["Mises à jour désactivées", "b-muted"],
   self_stack:      ["Stack de Drydock", "b-muted"],
   up_to_date:      ["À jour", "b-ok"],
@@ -107,7 +107,7 @@ const time = t => new Date(t * 1000).toLocaleTimeString("fr-FR");
 
 function matches(s) {
   if (filter === "all") return true;
-  if (filter === "updates") return ["updatable", "breaking", "major_available", "disabled"].includes(s.status);
+  if (filter === "updates") return ["updatable", "breaking", "manual", "disabled"].includes(s.status);
   if (filter === "up_to_date") return s.status === "up_to_date";
   return ["inactive", "unsupported", "error", "self_stack"].includes(s.status);
 }

@@ -4,7 +4,7 @@ use crate::compose;
 use crate::pangolin::Resource;
 use crate::portainer::{Container, Stack, STACK_TYPE_COMPOSE};
 use crate::registry::{ImageRef, PlatformSpec};
-use crate::version::{classify_labels, find_candidates, Severity, TagVersion};
+use crate::version::{classify_labels, same_major_candidate, Severity, TagVersion};
 use crate::AppState;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -50,8 +50,8 @@ pub enum StackStatus {
     Updatable,
     /// Pulling would bring a major version (floating tag moved): needs confirmation.
     Breaking,
-    /// Only a manual major tag bump is available.
-    MajorAvailable,
+    /// Updates exist but must be applied by hand (Git stack, image set by variable).
+    Manual,
     /// Updates exist but their containers are disabled by label.
     Disabled,
     /// The stack Drydock itself runs in: never updated by Drydock.
@@ -200,53 +200,35 @@ async fn analyse_image(
     let tag_shape = TagVersion::parse(&img.tag);
     let mut updates = vec![];
 
-    // 1. Newer tags (pinned / partially pinned version tags).
+    // 1. Newer tags in the same major (pinned / partially pinned version tags).
+    //    Like diun, other majors are never proposed.
     if tag_shape.is_some() {
         let tags = state.registry.list_tags(&img).await.context("listing tags")?;
-        if let Some(c) = find_candidates(&img.tag, &tags) {
-            if let Some((target, severity)) = c.same_major {
-                let pull_ref = compose_image
-                    .filter(|_| rewritable)
-                    .and_then(|i| compose::with_tag(i, &target).ok());
-                updates.push(Update {
-                    services: services.clone(),
-                    image: shown.clone(),
-                    kind: UpdateKind::Tag,
-                    current_tag: img.tag.clone(),
-                    target_tag: target,
-                    current_version: local_version.clone(),
-                    new_version: None,
-                    severity,
-                    breaking: false,
-                    auto: rewritable,
-                    disabled: false,
-                    pull_ref,
-                    note: (!rewritable).then(|| {
-                        if stack.git_config.is_some() {
-                            "Stack Git : modifier le tag dans le dépôt".to_string()
-                        } else {
-                            "Image définie par variable : tag non modifiable".to_string()
-                        }
-                    }),
-                });
-            }
-            if let Some(target) = c.next_major {
-                updates.push(Update {
-                    services: services.clone(),
-                    image: shown.clone(),
-                    kind: UpdateKind::Tag,
-                    current_tag: img.tag.clone(),
-                    target_tag: target,
-                    current_version: local_version.clone(),
-                    new_version: None,
-                    severity: Severity::Major,
-                    breaking: true,
-                    auto: false,
-                    disabled: false,
-                    pull_ref: None,
-                    note: Some("Version majeure : migration manuelle (voir les notes de version)".into()),
-                });
-            }
+        if let Some((target, severity)) = same_major_candidate(&img.tag, &tags) {
+            let pull_ref = compose_image
+                .filter(|_| rewritable)
+                .and_then(|i| compose::with_tag(i, &target).ok());
+            updates.push(Update {
+                services: services.clone(),
+                image: shown.clone(),
+                kind: UpdateKind::Tag,
+                current_tag: img.tag.clone(),
+                target_tag: target,
+                current_version: local_version.clone(),
+                new_version: None,
+                severity,
+                breaking: false,
+                auto: rewritable,
+                disabled: false,
+                pull_ref,
+                note: (!rewritable).then(|| {
+                    if stack.git_config.is_some() {
+                        "Stack Git : modifier le tag dans le dépôt".to_string()
+                    } else {
+                        "Image définie par variable : tag non modifiable".to_string()
+                    }
+                }),
+            });
         }
     }
 
@@ -420,8 +402,8 @@ pub async fn analyse_stack(state: Arc<AppState>, stack: Stack, resources: Arc<Ve
         StackStatus::Breaking
     } else if report.can_update {
         StackStatus::Updatable
-    } else if report.updates.iter().any(|u| u.breaking && !u.disabled) {
-        StackStatus::MajorAvailable
+    } else if report.updates.iter().any(|u| !u.auto && !u.disabled) {
+        StackStatus::Manual
     } else if report.updates.iter().any(|u| u.disabled) {
         StackStatus::Disabled
     } else if !report.errors.is_empty() && report.updates.is_empty() {

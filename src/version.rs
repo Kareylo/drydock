@@ -33,7 +33,7 @@ impl TagVersion {
         })
     }
 
-    /// Same "shape": prefix, suffix and precision. `18-alpine` only matches `19-alpine`.
+    /// Same "shape": prefix, suffix and precision (`18-alpine` vs `19-alpine`, not `18.1-alpine`).
     pub fn same_shape(&self, other: &Self) -> bool {
         self.prefix == other.prefix
             && self.suffix == other.suffix
@@ -103,15 +103,10 @@ pub fn classify_labels(cur: Option<&str>, new: Option<&str>) -> Severity {
     }
 }
 
-/// Candidate newer tags for a version-shaped tag.
-pub struct TagCandidates {
-    /// Highest newer tag in the same major (safe).
-    pub same_major: Option<(String, Severity)>,
-    /// Highest newer tag overall, when its major differs (breaking).
-    pub next_major: Option<String>,
-}
-
-pub fn find_candidates(current: &str, tags: &[String]) -> Option<TagCandidates> {
+/// Highest newer tag in the same major as `current` (same prefix, suffix and
+/// precision), like diun: other majors are never proposed, so `18-alpine`
+/// never leads to `19-alpine`.
+pub fn same_major_candidate(current: &str, tags: &[String]) -> Option<(String, Severity)> {
     let cur = TagVersion::parse(current)?;
     if cur.looks_like_build_number() {
         return None;
@@ -123,19 +118,11 @@ pub fn find_candidates(current: &str, tags: &[String]) -> Option<TagCandidates> 
         .collect();
     newer.sort_by(|a, b| a.0.cmp_nums(&b.0));
 
-    let same_major = newer
+    newer
         .iter()
         .rev()
         .find(|(v, _)| !Severity::between(&cur.nums, &v.nums).is_breaking())
-        .map(|(v, t)| ((*t).clone(), Severity::between(&cur.nums, &v.nums)));
-    let next_major = newer
-        .last()
-        .filter(|(v, _)| Severity::between(&cur.nums, &v.nums).is_breaking())
-        .map(|(_, t)| (*t).clone());
-    Some(TagCandidates {
-        same_major,
-        next_major,
-    })
+        .map(|(v, t)| ((*t).clone(), Severity::between(&cur.nums, &v.nums)))
 }
 
 #[cfg(test)]
@@ -157,17 +144,20 @@ mod tests {
     }
 
     #[test]
-    fn candidates_minor_and_major() {
-        let c = find_candidates("8.34", &tags(&["8.33", "8.35", "8.36", "9.0", "9", "8.36-rc1"])).unwrap();
-        assert_eq!(c.same_major, Some(("8.36".into(), Severity::Minor)));
-        assert_eq!(c.next_major, Some("9.0".into()));
+    fn same_major_only() {
+        let t = tags(&["8.33", "8.35", "8.36", "9.0", "9", "8.36-rc1"]);
+        assert_eq!(same_major_candidate("8.34", &t), Some(("8.36".into(), Severity::Minor)));
+        // Already the latest of its major: nothing, even though 9.0 exists.
+        assert_eq!(same_major_candidate("8.36", &t), None);
     }
 
     #[test]
-    fn candidates_respect_suffix_and_precision() {
-        let c = find_candidates("18-alpine", &tags(&["18", "19-alpine", "18.1-alpine", "17-alpine"])).unwrap();
-        assert_eq!(c.same_major, None);
-        assert_eq!(c.next_major, Some("19-alpine".into()));
+    fn major_tags_are_never_proposed() {
+        // postgres:18-alpine must not lead to postgres:19-alpine.
+        let t = tags(&["18", "19-alpine", "20-alpine", "18.1-alpine", "17-alpine"]);
+        assert_eq!(same_major_candidate("18-alpine", &t), None);
+        // 0.x: a minor bump is breaking, so it is not proposed either.
+        assert_eq!(same_major_candidate("0.4.1", &tags(&["0.4.2", "0.5.0"])), Some(("0.4.2".into(), Severity::Patch)));
     }
 
     #[test]

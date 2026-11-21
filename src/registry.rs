@@ -511,7 +511,7 @@ mod tests {
 #[cfg(test)]
 mod live {
     use super::*;
-    use crate::version::find_candidates;
+    use crate::version::same_major_candidate;
 
     fn reg() -> Registry {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -524,13 +524,14 @@ mod live {
         let r = reg();
         let img = ImageRef::parse("docker.io/gotenberg/gotenberg:8.34").unwrap();
         let tags = r.list_tags(&img).await.unwrap();
-        let c = find_candidates("8.34", &tags).unwrap();
-        println!("gotenberg tags={} same_major={:?} next_major={:?}", tags.len(), c.same_major, c.next_major);
+        let c = same_major_candidate("8.34", &tags);
+        println!("gotenberg tags={} same_major={c:?}", tags.len());
 
         let img = ImageRef::parse("postgres:18-alpine").unwrap();
         let tags = r.list_tags(&img).await.unwrap();
-        let c = find_candidates("18-alpine", &tags).unwrap();
-        println!("postgres tags={} same_major={:?} next_major={:?}", tags.len(), c.same_major, c.next_major);
+        let c = same_major_candidate("18-alpine", &tags);
+        assert_eq!(c, None, "postgres:18-alpine must not propose another major");
+        println!("postgres tags={} same_major={c:?}", tags.len());
 
         for name in ["docker.io/traefik:latest", "ghcr.io/paperless-ngx/paperless-ngx:latest", "vaultwarden/server:latest-alpine"] {
             let img = ImageRef::parse(name).unwrap();
