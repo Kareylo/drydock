@@ -204,6 +204,7 @@ dependencies = [
  "axum",
  "base64",
  "futures",
+ "getrandom",
  "hyper-util",
  "regex",
  "reqwest",

@@ -24,6 +24,8 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 syste
 header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--card); position: sticky; top: 0; z-index: 2; }
 h1 { font-size: 18px; margin: 0; }
 .meta { color: var(--muted); font-size: 13px; }
+.actions { display: flex; gap: 8px; align-items: center; }
+.user { color: var(--muted); font-size: 13px; }
 main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
 .filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
 .chip { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; }
@@ -65,7 +67,11 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-
     <h1>Drydock</h1>
     <div class="meta" id="meta">Chargement…</div>
   </div>
-  <button class="ghost" id="scan">Rechercher les mises à jour</button>
+  <div class="actions">
+    <span class="user" id="user"></span>
+    <button class="ghost" id="logout" hidden>Se déconnecter</button>
+    <button class="ghost" id="scan">Rechercher les mises à jour</button>
+  </div>
 </header>
 <main>
   <div class="filters" id="filters"></div>
@@ -184,6 +190,8 @@ function renderStack(s) {
 
 function render() {
   if (!state) return;
+  document.getElementById("user").textContent = state.user ? state.user : "";
+  document.getElementById("logout").hidden = state.auth !== "oidc";
   document.getElementById("meta").textContent = state.scanning
     ? "Analyse en cours…"
     : `Dernière analyse : ${ago(state.last_scan)}`;
@@ -199,9 +207,17 @@ function render() {
     : `<div class="empty">${state.scanning && !state.last_scan ? "Première analyse en cours…" : "Aucune stack dans cette catégorie"}</div>`;
 }
 
+let loggedOut = false;
+
 async function load() {
+  if (loggedOut) return; // no polling, so no silent re-login through the provider
   try {
     const r = await fetch("api/state");
+    if (r.status === 401) {
+      // OIDC session expired: go back through the provider.
+      const body = await r.json().catch(() => ({}));
+      if (body.login) { location.href = body.login; return; }
+    }
     if (!r.ok) throw new Error(r.status);
     state = await r.json();
     render();
@@ -243,6 +259,10 @@ document.addEventListener("click", async e => {
     if (!r.ok) alert((await r.json().catch(() => ({}))).error || `Erreur ${r.status}`);
     open.add(id);
     load();
+  } else if (t.id === "logout") {
+    loggedOut = true;
+    await fetch("auth/logout", { method: "POST" });
+    document.body.innerHTML = '<main><div class="empty">Déconnecté. <a href="./">Se reconnecter</a></div></main>';
   } else if (t.id === "scan") {
     t.disabled = true;
     await fetch("api/scan", { method: "POST" });

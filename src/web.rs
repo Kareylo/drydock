@@ -1,10 +1,13 @@
+use crate::auth::{self, AuthConfig};
 use crate::{jobs, scan, AppState};
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use serde::Deserialize;
 use serde_json::json;
 use axum::http::HeaderValue;
@@ -53,6 +56,10 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
+/// Authenticated user name, set by `auth_guard` (empty with `AUTH_MODE=none`).
+#[derive(Clone)]
+pub struct AuthUser(pub String);
+
 pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/", get(index))
@@ -60,13 +67,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/scan", post(api_scan))
         .route("/api/stacks/{id}/update", post(api_update))
         .route("/api/jobs/{id}", get(api_job))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_guard));
+    // OIDC login flow: public, but behind the Host and cross-site checks.
+    let login = Router::new()
+        .route("/auth/login", get(auth_login))
+        .route("/auth/callback", get(auth_callback))
+        .route("/auth/logout", post(auth_logout));
+    let guarded = protected
+        .merge(login)
         // Last layer runs first: Host check, then cross-site check, then credentials.
-        .layer(middleware::from_fn_with_state(state.clone(), basic_auth))
         .layer(middleware::from_fn(same_origin_guard))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(protected)
+        .merge(guarded)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -130,11 +144,50 @@ async fn same_origin_guard(headers: HeaderMap, req: Request, next: Next) -> Resp
     }
 }
 
-async fn basic_auth(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request, next: Next) -> Response {
-    let Some((user, pass)) = &state.cfg.basic_auth else {
-        // Only possible with UI_AUTH_DISABLED=true (checked at startup).
-        return next.run(req).await;
+/// Authentication of the UI and API, according to `AUTH_MODE`.
+async fn auth_guard(State(state): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
+    let user = match &state.cfg.auth {
+        AuthConfig::None => Ok(String::new()),
+        AuthConfig::Basic { user, pass } => basic_check(req.headers(), user, pass).await,
+        AuthConfig::Proxy(p) => {
+            let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+            let h = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+            let user = p.user_header.as_deref().and_then(h);
+            auth::check_proxy(p, peer, h(&p.secret_header), user).map_err(|why| {
+                tracing::warn!("requête refusée (mode proxy) : {why}");
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+            })
+        }
+        AuthConfig::Oidc(_) => {
+            let session = match (&state.oidc, auth::cookie(header_str(req.headers(), header::COOKIE), auth::SESSION_COOKIE)) {
+                (Some(o), Some(id)) => o.session(id).await,
+                _ => None,
+            };
+            match session {
+                Some(s) => Ok(s.user),
+                // The page itself goes to the provider; API calls get a 401 the UI acts on.
+                None if req.method() == Method::GET && req.uri().path() == "/" => {
+                    Err((StatusCode::FOUND, [(header::LOCATION, "auth/login")]).into_response())
+                }
+                None => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "unauthenticated", "login": "auth/login" })),
+                )
+                    .into_response()),
+            }
+        }
     };
+    match user {
+        Ok(u) => {
+            req.extensions_mut().insert(AuthUser(u));
+            next.run(req).await
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// HTTP Basic check, with the failed-login throttle.
+async fn basic_check(headers: &HeaderMap, user: &str, pass: &str) -> Result<String, Response> {
     let ok = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -143,34 +196,107 @@ async fn basic_auth(State(state): State<Arc<AppState>>, headers: HeaderMap, req:
         .and_then(|b| String::from_utf8(b).ok())
         .is_some_and(|creds| credentials_match(&creds, user, pass));
     if ok {
-        next.run(req).await
-    } else {
-        if headers.contains_key(header::AUTHORIZATION) {
-            // Wrong credentials (not just the browser's first, credential-less request).
-            // One failure is throttled at a time; others are rejected at once
-            // instead of queueing (no pile-up of connections during a flood).
-            let Ok(_slot) = AUTH_FAILURE.try_lock() else {
-                AUTH_REJECTED.fetch_add(1, Ordering::Relaxed);
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, "1")],
-                    "too many attempts",
-                )
-                    .into_response();
-            };
-            match AUTH_REJECTED.swap(0, Ordering::Relaxed) {
-                0 => tracing::warn!("authentification UI refusée"),
-                n => tracing::warn!("authentification UI refusée ({n} autre(s) tentative(s) rejetée(s) en 429)"),
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"drydock\"")],
-            "unauthorized",
-        )
-            .into_response()
+        return Ok(user.to_string());
     }
+    if headers.contains_key(header::AUTHORIZATION) {
+        // Wrong credentials (not just the browser's first, credential-less request).
+        // One failure is throttled at a time; others are rejected at once
+        // instead of queueing (no pile-up of connections during a flood).
+        let Ok(_slot) = AUTH_FAILURE.try_lock() else {
+            AUTH_REJECTED.fetch_add(1, Ordering::Relaxed);
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "1")],
+                "too many attempts",
+            )
+                .into_response());
+        };
+        match AUTH_REJECTED.swap(0, Ordering::Relaxed) {
+            0 => tracing::warn!("authentification UI refusée"),
+            n => tracing::warn!("authentification UI refusée ({n} autre(s) tentative(s) rejetée(s) en 429)"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"drydock\"")],
+        "unauthorized",
+    )
+        .into_response())
+}
+
+fn plain(status: StatusCode, msg: String) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], msg).into_response()
+}
+
+/// `GET /auth/login`: redirect to the OIDC provider.
+async fn auth_login(State(state): State<Arc<AppState>>) -> Response {
+    let Some(oidc) = &state.oidc else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match oidc.begin_login().await {
+        Ok((url, login_state)) => {
+            let cookie = auth::set_cookie(auth::STATE_COOKIE, &login_state, "/auth", 600, oidc.cfg.secure_cookies());
+            (StatusCode::FOUND, [(header::LOCATION, url), (header::SET_COOKIE, cookie)]).into_response()
+        }
+        Err(e) => {
+            tracing::error!("OIDC : connexion impossible : {e:#}");
+            plain(StatusCode::BAD_GATEWAY, "Fournisseur OIDC injoignable, voir les logs de Drydock.".into())
+        }
+    }
+}
+
+/// `GET /auth/callback`: back from the provider, open a session.
+async fn auth_callback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(oidc) = &state.oidc else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(err) = q.get("error") {
+        tracing::warn!("OIDC : le fournisseur a refusé la connexion : {err}");
+        return plain(StatusCode::FORBIDDEN, format!("Connexion refusée par le fournisseur : {err}"));
+    }
+    let (Some(code), Some(login_state)) = (q.get("code"), q.get("state")) else {
+        return plain(StatusCode::BAD_REQUEST, "Paramètres code/state manquants.".into());
+    };
+    let cookie_state = auth::cookie(header_str(&headers, header::COOKIE), auth::STATE_COOKIE);
+    match oidc.finish_login(login_state, cookie_state, code).await {
+        Ok((session_id, user)) => {
+            tracing::info!("OIDC : connexion de {user}");
+            let secure = oidc.cfg.secure_cookies();
+            let mut h = HeaderMap::new();
+            h.insert(header::LOCATION, HeaderValue::from_static("../"));
+            let ttl = oidc.cfg.session_ttl.as_secs();
+            for c in [
+                auth::set_cookie(auth::SESSION_COOKIE, &session_id, "/", ttl, secure),
+                auth::set_cookie(auth::STATE_COOKIE, "", "/auth", 0, secure),
+            ] {
+                if let Ok(v) = HeaderValue::from_str(&c) {
+                    h.append(header::SET_COOKIE, v);
+                }
+            }
+            (StatusCode::FOUND, h).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("OIDC : connexion refusée : {e:#}");
+            plain(StatusCode::FORBIDDEN, format!("Connexion refusée : {e:#}"))
+        }
+    }
+}
+
+/// `POST /auth/logout`: close the Drydock session (the provider session stays).
+async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(oidc) = &state.oidc else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(id) = auth::cookie(header_str(&headers, header::COOKIE), auth::SESSION_COOKIE) {
+        oidc.logout(id).await;
+    }
+    let clear = auth::set_cookie(auth::SESSION_COOKIE, "", "/", 0, oidc.cfg.secure_cookies());
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response()
 }
 
 /// Compares fixed-length digests in constant time: neither the content nor the
@@ -185,10 +311,12 @@ async fn index() -> Html<&'static str> {
     Html(INDEX)
 }
 
-async fn api_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn api_state(State(state): State<Arc<AppState>>, user: Option<Extension<AuthUser>>) -> impl IntoResponse {
     let snap = state.snapshot.read().await.clone();
     let jobs: Vec<_> = state.jobs.lock().await.values().rev().take(20).cloned().collect();
     Json(json!({
+        "auth": state.cfg.auth.mode(),
+        "user": user.map(|u| u.0.0.clone()).filter(|u| !u.is_empty()),
         "scanning": state.scanning.load(Ordering::SeqCst),
         "last_scan": snap.last_scan,
         "last_error": snap.last_error,

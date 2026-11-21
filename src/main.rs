@@ -1,4 +1,5 @@
 mod analysis;
+mod auth;
 mod compose;
 mod config;
 mod jobs;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub scanning: AtomicBool,
     /// Drydock's own container: its stack is never updated.
     pub self_id: Option<selfid::SelfId>,
+    /// OIDC logins and sessions (`AUTH_MODE=oidc`).
+    pub oidc: Option<auth::Oidc>,
 }
 
 /// Full scan of all stacks. Returns immediately if a scan is already running.
@@ -144,6 +147,7 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cfg = config::Config::from_env()?;
+    let cfg_auth = cfg.auth.clone();
     let state = Arc::new(AppState {
         portainer: portainer::Portainer::new(
             &cfg.portainer_url,
@@ -162,6 +166,10 @@ async fn main() -> Result<()> {
         jobs: Mutex::new(BTreeMap::new()),
         scanning: AtomicBool::new(false),
         self_id: selfid::detect(),
+        oidc: match &cfg_auth {
+            auth::AuthConfig::Oidc(o) => Some(auth::Oidc::new(o.clone())?),
+            _ => None,
+        },
     });
 
     match &state.self_id {
@@ -184,12 +192,27 @@ async fn main() -> Result<()> {
             "PANGOLIN_URL en http:// : la clé d'intégration circule en clair, à réserver à un réseau Docker isolé"
         );
     }
-    if state.cfg.auth_disabled && state.cfg.basic_auth.is_none() {
-        tracing::warn!(
-            "authentification UI désactivée (UI_AUTH_DISABLED) : Drydock doit être derrière un proxy authentifiant"
-        );
-        if state.cfg.allowed_hosts.is_empty() {
-            tracing::warn!("ALLOWED_HOSTS absent : définir le domaine public de Drydock pour bloquer le DNS rebinding");
+    match &state.cfg.auth {
+        auth::AuthConfig::Basic { .. } => tracing::info!("authentification UI : basic"),
+        auth::AuthConfig::Proxy(p) => {
+            tracing::info!("authentification UI : proxy (en-tête {})", p.secret_header);
+            if p.trusted.is_empty() {
+                tracing::warn!("PROXY_TRUSTED_IPS absent : seul le secret partagé protège Drydock");
+            }
+        }
+        auth::AuthConfig::Oidc(o) => {
+            tracing::info!("authentification UI : OIDC ({})", o.issuer);
+            if o.allowed_users.is_empty() && o.allowed_groups.is_empty() {
+                tracing::warn!(
+                    "OIDC_ALLOWED_GROUPS et OIDC_ALLOWED_USERS absents : tout utilisateur du fournisseur peut mettre à jour les stacks"
+                );
+            }
+        }
+        auth::AuthConfig::None => {
+            tracing::warn!("authentification UI désactivée (AUTH_MODE=none) : Drydock doit être protégé autrement");
+            if state.cfg.allowed_hosts.is_empty() {
+                tracing::warn!("ALLOWED_HOSTS absent : définir le domaine public de Drydock pour bloquer le DNS rebinding");
+            }
         }
     }
     if let Err(e) = state.portainer.ping().await {
@@ -255,9 +278,9 @@ async fn serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<(
     let mut full_logged = false;
 
     loop {
-        let stream = tokio::select! {
+        let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok(accepted) => accepted,
                 Err(e) => {
                     // EMFILE and friends: keep serving instead of exiting.
                     tracing::warn!("accept: {e}");
@@ -277,7 +300,10 @@ async fn serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<(
             continue;
         };
         full_logged = false;
-        let svc = TowerToHyperService::new(app.clone());
+        // Peer address for handlers (proxy mode checks PROXY_TRUSTED_IPS).
+        let svc = TowerToHyperService::new(
+            app.clone().layer(axum::Extension(axum::extract::ConnectInfo(peer))),
+        );
         let builder = builder.clone();
         let watcher = graceful.watcher();
         tokio::spawn(async move {

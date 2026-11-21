@@ -69,12 +69,73 @@ Une image partagée par plusieurs services est mise à jour seulement si **tous*
 | `REGISTRY_AUTH` (ou `_FILE`) | — | `docker.io=user:token,ghcr.io=user:token` (limites de requêtes, images privées) |
 | `REGISTRY_AUTH_REALMS` | — | serveurs de jetons supplémentaires autorisés à recevoir ces identifiants, ex. `ghcr.io` pour `lscr.io`. Par défaut : le registre lui-même et les hôtes du même domaine (`auth.docker.io` pour Docker Hub). Les serveurs de jetons en `http://` sont toujours refusés |
 | `REGISTRY_ALLOWLIST` | — | registres que Drydock a le droit d'interroger, ex. `docker.io,ghcr.io,lscr.io`. Vide : tous |
-| `UI_BASIC_AUTH` (ou `_FILE`) | requis | `user:motdepasse`, avec un utilisateur non vide et un mot de passe d'au moins 12 caractères. Sinon, Drydock refuse de démarrer |
-| `UI_AUTH_DISABLED` | `false` | `true` désactive l'authentification. Uniquement si un proxy authentifiant (SSO Pangolin) protège Drydock |
-| `ALLOWED_HOSTS` | — | noms d'hôte acceptés, ex. `drydock.example.com` (protection contre le DNS rebinding). Recommandé avec `UI_AUTH_DISABLED` |
+| `AUTH_MODE` | `basic` si `UI_BASIC_AUTH` est défini | `basic`, `proxy`, `oidc` ou `none`. Voir [Authentification](#authentification). Sans mode valide, Drydock refuse de démarrer |
+| `ALLOWED_HOSTS` | — | noms d'hôte acceptés, ex. `drydock.example.com` (protection contre le DNS rebinding). Recommandé avec `AUTH_MODE=none` ou `proxy` |
 | `MAINTENANCE_TITLE` / `MAINTENANCE_MESSAGE` | texte FR | contenu de la page de maintenance |
 | `LISTEN` | `0.0.0.0:8080` | adresse d'écoute |
 | `RUST_LOG` | `drydock=info` | niveau de logs |
+
+## Authentification
+
+L'interface et l'API sont toujours protégées. Choisis un mode avec `AUTH_MODE`.
+
+### `basic` : mot de passe
+
+| Variable | Rôle |
+|---|---|
+| `UI_BASIC_AUTH` (ou `_FILE`) | `user:motdepasse`, utilisateur non vide, mot de passe d'au moins 12 caractères |
+
+### `proxy` : Pangolin SSO, Authelia en forward-auth…
+
+Le proxy authentifie l'utilisateur, puis ajoute à chaque requête vers Drydock un en-tête contenant un secret partagé. Drydock refuse toute requête sans ce secret : un accès direct au conteneur, sans passer par le proxy, est donc bloqué.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `PROXY_AUTH_SECRET` (ou `_FILE`) | requis | secret partagé, au moins 24 caractères (`openssl rand -base64 32`) |
+| `PROXY_AUTH_SECRET_HEADER` | `X-Drydock-Proxy-Secret` | en-tête où le proxy place ce secret |
+| `PROXY_USER_HEADER` | — | en-tête contenant l'utilisateur authentifié (ex. `Remote-User`). S'il est défini, il devient obligatoire |
+| `PROXY_TRUSTED_IPS` | — | adresses ou réseaux autorisés à joindre Drydock, ex. `172.18.0.0/16` (réseau Docker du proxy). Recommandé |
+
+- **Pangolin :** active l'authentification SSO sur la ressource Drydock, puis ajoute l'en-tête `X-Drydock-Proxy-Secret: <secret>` aux requêtes transmises à Drydock (en-têtes personnalisés de la ressource, si ta version de Pangolin le permet). Vérifie quel en-tête d'identité ta version transmet avant de définir `PROXY_USER_HEADER`.
+- **Authelia + Traefik :** middleware `forwardAuth` vers Authelia (avec `authResponseHeaders: Remote-User`), plus un middleware `headers` dont `customRequestHeaders` ajoute le secret.
+
+### `oidc` : n'importe quel fournisseur OpenID Connect (Authelia, Authentik, Keycloak…)
+
+Drydock redirige vers le fournisseur (flux *authorization code* avec PKCE), puis ouvre une session : cookie `HttpOnly`, `SameSite=Lax`, et `Secure` en HTTPS.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `OIDC_ISSUER` | requis | URL de l'émetteur, en `https://` |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` (ou `_FILE`) | requis | client confidentiel, authentifié par `client_secret_basic` |
+| `OIDC_REDIRECT_URL` | requis | `https://drydock.example.com/auth/callback`, déclarée chez le fournisseur |
+| `OIDC_SCOPES` | `openid profile email groups` | scopes demandés |
+| `OIDC_ALLOWED_GROUPS` / `OIDC_ALLOWED_USERS` | — | groupes ou utilisateurs (nom, e-mail ou `sub`) autorisés. Sans eux, **tout utilisateur du fournisseur** peut mettre à jour les stacks (un avertissement est loggé) |
+| `OIDC_GROUPS_CLAIM` | `groups` | claim qui contient les groupes |
+| `OIDC_SESSION_HOURS` | `8` | durée maximale d'une session |
+
+Exemple de client Authelia :
+
+```yaml
+identity_providers:
+  oidc:
+    clients:
+      - client_id: drydock
+        client_name: Drydock
+        client_secret: '$pbkdf2-sha512$...'   # authelia crypto hash generate
+        public: false
+        authorization_policy: two_factor
+        require_pkce: true
+        pkce_challenge_method: S256
+        redirect_uris: ['https://drydock.example.com/auth/callback']
+        scopes: [openid, profile, email, groups]
+        token_endpoint_auth_method: client_secret_basic
+```
+
+La déconnexion ferme la session Drydock. La session chez le fournisseur reste ouverte. Les sessions sont gardées en mémoire, donc un redémarrage de Drydock impose de se reconnecter. En mode `oidc`, l'API n'est utilisable que depuis l'interface (cookie de session).
+
+### `none`
+
+Aucune authentification. Ce mode est réservé au cas où quelque chose d'autre protège Drydock. Un avertissement est loggé. L'ancien `UI_AUTH_DISABLED=true` correspond à ce mode.
 
 ## Déploiement
 

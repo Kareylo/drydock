@@ -1,3 +1,4 @@
+use crate::auth::{check_url_scheme, AuthConfig, Cidr, OidcConfig, ProxyAuth, MIN_PROXY_SECRET_CHARS};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::env;
@@ -32,9 +33,8 @@ pub struct Config {
     pub registry_realms: Vec<String>,
     /// When set, only these registries are queried (`REGISTRY_ALLOWLIST`).
     pub registry_allowlist: Vec<String>,
-    pub basic_auth: Option<(String, String)>,
-    /// Explicit opt-out of UI authentication (Drydock behind an authenticating proxy).
-    pub auth_disabled: bool,
+    /// UI authentication mode (`AUTH_MODE`).
+    pub auth: AuthConfig,
     /// Accepted `Host` values (DNS rebinding protection); empty = any.
     pub allowed_hosts: Vec<String>,
     pub maintenance_title: String,
@@ -63,8 +63,7 @@ impl std::fmt::Debug for Config {
             .field("registry_auth", &self.registry_auth.keys().collect::<Vec<_>>())
             .field("registry_realms", &self.registry_realms)
             .field("registry_allowlist", &self.registry_allowlist)
-            .field("basic_auth", &self.basic_auth.as_ref().map(|(u, _)| (u, REDACTED)))
-            .field("auth_disabled", &self.auth_disabled)
+            .field("auth", &self.auth)
             .field("allowed_hosts", &self.allowed_hosts)
             .finish_non_exhaustive()
     }
@@ -94,6 +93,79 @@ fn parse_basic_auth(v: &str) -> Result<(&str, &str)> {
         bail!("UI_BASIC_AUTH: password must be at least {MIN_PASSWORD_CHARS} characters");
     }
     Ok((u, p))
+}
+
+fn list_var(name: &str) -> Vec<String> {
+    var(name)
+        .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// `AUTH_MODE` = basic | proxy | oidc | none. Without it: `basic` when
+/// `UI_BASIC_AUTH` is set, `none` with the legacy `UI_AUTH_DISABLED=true`.
+/// Fail closed: the API can redeploy every stack, it must not be open by accident.
+fn parse_auth() -> Result<AuthConfig> {
+    let mode = match var("AUTH_MODE").map(|m| m.trim().to_lowercase()) {
+        Some(m) => m,
+        None if var("UI_BASIC_AUTH").is_some() || var("UI_BASIC_AUTH_FILE").is_some() => "basic".into(),
+        None if bool_var("UI_AUTH_DISABLED", false) => "none".into(),
+        None => bail!(
+            "UI authentication is required: set AUTH_MODE (basic, proxy, oidc) or UI_BASIC_AUTH; \
+             AUTH_MODE=none only when something else protects Drydock"
+        ),
+    };
+    Ok(match mode.as_str() {
+        "basic" => {
+            let v = secret("UI_BASIC_AUTH")?.context("AUTH_MODE=basic needs UI_BASIC_AUTH (or UI_BASIC_AUTH_FILE)")?;
+            let (u, p) = parse_basic_auth(&v)?;
+            AuthConfig::Basic { user: u.to_string(), pass: p.to_string() }
+        }
+        "proxy" => {
+            let secret = secret("PROXY_AUTH_SECRET")?
+                .context("AUTH_MODE=proxy needs PROXY_AUTH_SECRET (or PROXY_AUTH_SECRET_FILE)")?;
+            if secret.chars().count() < MIN_PROXY_SECRET_CHARS {
+                bail!("PROXY_AUTH_SECRET must be at least {MIN_PROXY_SECRET_CHARS} characters");
+            }
+            let trusted = list_var("PROXY_TRUSTED_IPS")
+                .iter()
+                .map(|c| Cidr::parse(c))
+                .collect::<Result<Vec<_>>>()
+                .context("PROXY_TRUSTED_IPS")?;
+            AuthConfig::Proxy(ProxyAuth {
+                secret_header: var_or("PROXY_AUTH_SECRET_HEADER", "X-Drydock-Proxy-Secret").to_lowercase(),
+                secret,
+                user_header: var("PROXY_USER_HEADER").map(|h| h.trim().to_lowercase()),
+                trusted,
+            })
+        }
+        "oidc" => {
+            let issuer = var("OIDC_ISSUER").context("AUTH_MODE=oidc needs OIDC_ISSUER")?;
+            let issuer = issuer.trim().trim_end_matches('/').to_string();
+            check_url_scheme("OIDC_ISSUER", &issuer)?;
+            let redirect_url = var("OIDC_REDIRECT_URL").context("AUTH_MODE=oidc needs OIDC_REDIRECT_URL")?;
+            check_url_scheme("OIDC_REDIRECT_URL", &redirect_url)?;
+            if !redirect_url.trim_end_matches('/').ends_with("/auth/callback") {
+                bail!("OIDC_REDIRECT_URL must end with /auth/callback");
+            }
+            let hours = var("OIDC_SESSION_HOURS")
+                .map(|v| v.parse::<u64>().context("OIDC_SESSION_HOURS must be a number"))
+                .unwrap_or(Ok(8))?;
+            AuthConfig::Oidc(OidcConfig {
+                issuer,
+                client_id: var("OIDC_CLIENT_ID").context("AUTH_MODE=oidc needs OIDC_CLIENT_ID")?,
+                client_secret: secret("OIDC_CLIENT_SECRET")?
+                    .context("AUTH_MODE=oidc needs OIDC_CLIENT_SECRET (or OIDC_CLIENT_SECRET_FILE)")?,
+                redirect_url: redirect_url.trim_end_matches('/').to_string(),
+                scopes: var_or("OIDC_SCOPES", "openid profile email groups"),
+                groups_claim: var_or("OIDC_GROUPS_CLAIM", "groups"),
+                allowed_groups: list_var("OIDC_ALLOWED_GROUPS"),
+                allowed_users: list_var("OIDC_ALLOWED_USERS").into_iter().map(|u| u.to_lowercase()).collect(),
+                session_ttl: Duration::from_secs(hours.max(1) * 3600),
+            })
+        }
+        "none" => AuthConfig::None,
+        other => bail!("AUTH_MODE {other}: expected basic, proxy, oidc or none"),
+    })
 }
 
 fn var(name: &str) -> Option<String> {
@@ -155,20 +227,7 @@ impl Config {
             }
         }
 
-        let basic_auth = match secret("UI_BASIC_AUTH")? {
-            Some(v) => {
-                let (u, p) = parse_basic_auth(&v)?;
-                Some((u.to_string(), p.to_string()))
-            }
-            None => None,
-        };
-        // Fail closed: the API can redeploy every stack, it must not be open by accident.
-        let auth_disabled = bool_var("UI_AUTH_DISABLED", false);
-        if basic_auth.is_none() && !auth_disabled {
-            bail!(
-                "UI_BASIC_AUTH (or UI_BASIC_AUTH_FILE) is required; set UI_AUTH_DISABLED=true only when an authenticating proxy protects Drydock"
-            );
-        }
+        let auth = parse_auth()?;
         let allowed_hosts = var("ALLOWED_HOSTS")
             .map(|v| {
                 v.split(',')
@@ -217,8 +276,7 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
-            basic_auth,
-            auth_disabled,
+            auth,
             allowed_hosts,
             maintenance_title: var_or("MAINTENANCE_TITLE", "Mise à jour en cours"),
             maintenance_message: var_or(
@@ -265,8 +323,7 @@ mod tests {
             registry_auth: HashMap::from([("ghcr.io".into(), ("u".into(), "REG_SECRET".into()))]),
             registry_realms: vec![],
             registry_allowlist: vec![],
-            basic_auth: Some(("admin".into(), "UI_SECRET".into())),
-            auth_disabled: false,
+            auth: AuthConfig::Basic { user: "admin".into(), pass: "UI_SECRET".into() },
             allowed_hosts: vec![],
             maintenance_title: String::new(),
             maintenance_message: String::new(),

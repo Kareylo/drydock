@@ -23,9 +23,20 @@ services:
       # Secrets are read from files, so they do not show up in `docker inspect`.
       PORTAINER_API_KEY_FILE: /run/secrets/portainer_api_key
       PANGOLIN_API_KEY_FILE: /run/secrets/pangolin_api_key
-      # Required (user:password). Behind Pangolin SSO only, use instead:
-      # UI_AUTH_DISABLED: "true" and ALLOWED_HOSTS: drydock.example.com
+      # UI authentication (see README, "Authentification"): basic, proxy or oidc.
+      AUTH_MODE: basic
       UI_BASIC_AUTH_FILE: /run/secrets/drydock_ui_auth
+      # Behind Pangolin SSO / Authelia forward-auth:
+      #   AUTH_MODE: proxy
+      #   PROXY_AUTH_SECRET_FILE: /run/secrets/drydock_proxy_secret
+      #   PROXY_TRUSTED_IPS: 172.18.0.0/16
+      # Any OIDC provider (Authelia, Authentik, Keycloak…):
+      #   AUTH_MODE: oidc
+      #   OIDC_ISSUER: https://auth.example.com
+      #   OIDC_CLIENT_ID: drydock
+      #   OIDC_CLIENT_SECRET_FILE: /run/secrets/drydock_oidc_secret
+      #   OIDC_REDIRECT_URL: https://drydock.example.com/auth/callback
+      #   OIDC_ALLOWED_GROUPS: admins
     secrets:
       - portainer_api_key
       - pangolin_api_key
