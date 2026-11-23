@@ -425,7 +425,7 @@ fn form_encode(s: &str) -> String {
 /// 256-bit random token, base64url.
 pub fn random_token() -> String {
     let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).expect("OS random generator");
+    getrandom::fill(&mut b).expect("OS random generator");
     URL_SAFE_NO_PAD.encode(b)
 }
 
