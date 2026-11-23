@@ -31,6 +31,10 @@ pub struct Job {
     pub status: JobStatus,
     pub started_at: u64,
     pub finished_at: Option<u64>,
+    /// Who started it (`-` when the UI has no authentication).
+    pub requested_by: String,
+    /// A major update was confirmed.
+    pub forced: bool,
     pub log: Vec<LogLine>,
 }
 
@@ -244,7 +248,7 @@ async fn run(ctx: &Ctx, stack_id: i64, force: bool) -> Result<()> {
     outcome
 }
 
-pub async fn start(state: Arc<AppState>, stack_id: i64, force: bool) -> Result<u64> {
+pub async fn start(state: Arc<AppState>, stack_id: i64, force: bool, requested_by: String) -> Result<u64> {
     let stack_name = {
         let snap = state.snapshot.read().await;
         snap.stacks
@@ -271,6 +275,8 @@ pub async fn start(state: Arc<AppState>, stack_id: i64, force: bool) -> Result<u
                 status: JobStatus::Running,
                 started_at: now(),
                 finished_at: None,
+                requested_by: requested_by.clone(),
+                forced: force,
                 log: vec![],
             },
         );
@@ -284,6 +290,11 @@ pub async fn start(state: Arc<AppState>, stack_id: i64, force: bool) -> Result<u
 
     tokio::spawn(async move {
         let ctx = Ctx { state: state.clone(), job_id: id };
+        ctx.log(format!(
+            "Demandée par {requested_by}{}",
+            if force { " (mise à jour majeure confirmée)" } else { "" }
+        ))
+        .await;
         let result = run(&ctx, stack_id, force).await;
         let status = match &result {
             Ok(()) => {

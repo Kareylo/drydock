@@ -32,6 +32,9 @@ impl Resource {
     }
 }
 
+/// Largest Pangolin API response read.
+const RESPONSE_MAX: usize = 8 << 20;
+
 pub struct Pangolin {
     http: Client,
     cfg: PangolinConfig,
@@ -49,9 +52,17 @@ impl Pangolin {
     }
 
     async fn call(&self, req: RequestBuilder) -> Result<Value> {
-        let resp = req.bearer_auth(&self.cfg.api_key).send().await?;
+        let mut resp = req.bearer_auth(&self.cfg.api_key).send().await?;
         let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        // Capped: a page of 100 resources is a few hundred KB at most.
+        let mut raw = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            raw.extend_from_slice(&chunk);
+            if raw.len() > RESPONSE_MAX {
+                bail!("Pangolin HTTP {status}: réponse de plus de {RESPONSE_MAX} octets");
+            }
+        }
+        let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         if !status.is_success() {
             let msg = body.get("message").and_then(Value::as_str).unwrap_or("");
             let hint = match status.as_u16() {

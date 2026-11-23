@@ -37,6 +37,10 @@ pub struct Config {
     pub auth: AuthConfig,
     /// Accepted `Host` values (DNS rebinding protection); empty = any.
     pub allowed_hosts: Vec<String>,
+    /// Send `Strict-Transport-Security` (`HSTS`, default on).
+    pub hsts: bool,
+    /// Reverse proxies whose `X-Forwarded-For` names the client (`TRUSTED_PROXIES`).
+    pub trusted_proxies: Vec<Cidr>,
     pub maintenance_title: String,
     pub maintenance_message: String,
 }
@@ -79,8 +83,10 @@ impl std::fmt::Debug for PangolinConfig {
     }
 }
 
-/// Minimum UI password length: failed logins are throttled to about one per
-/// second, so the password itself must resist that rate for years.
+/// Minimum UI password length: failed logins are bounded to about two per
+/// second from all clients together, parallel requests included
+/// (`AUTH_LIMITER` in web.rs), so the password itself must resist that rate
+/// for years.
 const MIN_PASSWORD_CHARS: usize = 12;
 
 /// `user:password`, with a non-empty user and a password of at least 12 characters.
@@ -278,6 +284,12 @@ impl Config {
                 .unwrap_or_default(),
             auth,
             allowed_hosts,
+            hsts: bool_var("HSTS", true),
+            trusted_proxies: list_var("TRUSTED_PROXIES")
+                .iter()
+                .map(|c| Cidr::parse(c))
+                .collect::<Result<Vec<_>>>()
+                .context("TRUSTED_PROXIES")?,
             maintenance_title: var_or("MAINTENANCE_TITLE", "Mise à jour en cours"),
             maintenance_message: var_or(
                 "MAINTENANCE_MESSAGE",
@@ -325,6 +337,8 @@ mod tests {
             registry_allowlist: vec![],
             auth: AuthConfig::Basic { user: "admin".into(), pass: "UI_SECRET".into() },
             allowed_hosts: vec![],
+            hsts: true,
+            trusted_proxies: vec![],
             maintenance_title: String::new(),
             maintenance_message: String::new(),
         };

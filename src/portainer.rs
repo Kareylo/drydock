@@ -115,6 +115,36 @@ fn check_redirect(resp: &reqwest::Response) -> Result<()> {
     Ok(())
 }
 
+/// Longest progress line kept while reading a pull stream.
+const PULL_LINE_MAX: usize = 64 << 10;
+
+/// Reads a Docker pull progress stream line by line (never buffered whole: a
+/// large image produces megabytes of progress) and fails on its first `error`.
+async fn pull_stream_error(mut resp: reqwest::Response) -> Result<()> {
+    let check = |line: &[u8]| -> Result<()> {
+        let v: Option<Value> = serde_json::from_slice(line).ok();
+        match v.as_ref().and_then(|v| v.get("error")).and_then(Value::as_str) {
+            Some(err) => anyhow::bail!("{err}"),
+            None => Ok(()),
+        }
+    };
+    let mut line = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let mut rest = &chunk[..];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&rest[..i]);
+            check(&line)?;
+            line.clear();
+            rest = &rest[i + 1..];
+        }
+        line.extend_from_slice(rest);
+        if line.len() > PULL_LINE_MAX {
+            anyhow::bail!("pull stream line longer than {PULL_LINE_MAX} bytes");
+        }
+    }
+    check(&line)
+}
+
 pub struct Portainer {
     http: Client,
     /// Separate client without timeout for long deployments.
@@ -228,18 +258,11 @@ impl Portainer {
             .map_err(tls_hint)?;
         let status = resp.status();
         check_redirect(&resp)?;
-        let body = resp.text().await?;
         if !status.is_success() {
+            let body = resp.text().await?;
             anyhow::bail!("pull {image}: HTTP {status}: {}", body.chars().take(400).collect::<String>());
         }
-        for line in body.lines() {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                if let Some(err) = v.get("error").and_then(Value::as_str) {
-                    anyhow::bail!("pull {image}: {err}");
-                }
-            }
-        }
-        Ok(())
+        pull_stream_error(resp).await.map_err(|e| anyhow::anyhow!("pull {image}: {e:#}"))
     }
 
     /// Redeploy a compose stack with a (possibly modified) file. Images are not
@@ -276,5 +299,48 @@ impl Portainer {
     pub async fn ping(&self) -> Result<()> {
         let _: Value = Self::json(self.get("/system/version")).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Local HTTP server streaming `body` in small chunks, without Content-Length.
+    async fn stream(body: Vec<u8>) -> reqwest::Response {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Some(mut c) = l.incoming().flatten().next() {
+                let mut b = [0u8; 1024];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for part in body.chunks(7) {
+                    let _ = c.write_all(format!("{:x}\r\n", part.len()).as_bytes());
+                    let _ = c.write_all(part);
+                    let _ = c.write_all(b"\r\n");
+                }
+                let _ = c.write_all(b"0\r\n\r\n");
+            }
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Client::new().get(format!("http://{addr}/")).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pull_stream_errors() {
+        let ok = b"{\"status\":\"Pulling\"}\n{\"status\":\"Done\"}\n".to_vec();
+        assert!(pull_stream_error(stream(ok).await).await.is_ok());
+        // Error split across chunks, on the last line without a newline.
+        let err = b"{\"status\":\"Pulling\"}\n{\"error\":\"manifest unknown\"}".to_vec();
+        let e = pull_stream_error(stream(err).await).await.unwrap_err();
+        assert_eq!(e.to_string(), "manifest unknown");
+        // Many progress lines are fine (never buffered whole).
+        let many = b"{\"status\":\"Downloading\"}\n".repeat(100_000);
+        assert!(pull_stream_error(stream(many).await).await.is_ok());
+        // One endless line is refused.
+        let long = vec![b'a'; PULL_LINE_MAX + 100];
+        assert!(pull_stream_error(stream(long).await).await.is_err());
     }
 }

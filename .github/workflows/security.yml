@@ -28,11 +28,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Unit tests
         run: cargo test --locked
+      - name: Lint (clippy, warnings are errors)
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Dependency audit (RustSec)
         run: |
           # Pinned: Dependabot does not update `cargo install` lines, bump by hand.
           cargo install cargo-audit --version 0.23.0 --locked
           cargo audit --deny warnings
+      - name: Dependency policy (cargo deny)
+        run: |
+          # Licenses, crates.io-only sources, yanked crates: see deny.toml.
+          # Pinned like cargo-audit: bump by hand.
+          cargo install cargo-deny --version 0.22.0 --locked
+          cargo deny check
 
   image-scan:
     runs-on: ubuntu-latest

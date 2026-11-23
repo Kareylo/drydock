@@ -10,9 +10,11 @@ RUN cargo install cargo-auditable --version 0.7.7 --locked
 WORKDIR /src
 
 # Dependency layer (cached while Cargo.toml/Cargo.lock don't change).
+# Its stub main.rs uses no crate, so Cargo >= 1.100 would flag every dependency
+# as unused: warnings are muted for this step only, the real build keeps them.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src web && echo 'fn main() {}' > src/main.rs && touch web/index.html \
- && cargo build --release --locked && rm -rf src web
+ && CARGO_BUILD_WARNINGS=allow cargo build --release --locked && rm -rf src web
 
 COPY src ./src
 COPY web ./web

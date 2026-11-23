@@ -214,33 +214,33 @@ async fn analyse_image(
     } else {
         None
     };
-    if let Some(tags) = tags {
-        if let Some((target, severity)) = same_major_candidate(&img.tag, &tags) {
-            let pull_ref = compose_image
-                .filter(|_| rewritable)
-                .and_then(|i| compose::with_tag(i, &target).ok());
-            updates.push(Update {
-                services: services.clone(),
-                image: shown.clone(),
-                kind: UpdateKind::Tag,
-                current_tag: img.tag.clone(),
-                target_tag: target,
-                current_version: local_version.clone(),
-                new_version: None,
-                severity,
-                breaking: false,
-                auto: rewritable,
-                disabled: false,
-                pull_ref,
-                note: (!rewritable).then(|| {
-                    if stack.git_config.is_some() {
-                        "Stack Git : modifier le tag dans le dépôt".to_string()
-                    } else {
-                        "Image définie par variable : tag non modifiable".to_string()
-                    }
-                }),
-            });
-        }
+    if let Some(tags) = tags
+        && let Some((target, severity)) = same_major_candidate(&img.tag, &tags)
+    {
+        let pull_ref = compose_image
+            .filter(|_| rewritable)
+            .and_then(|i| compose::with_tag(i, &target).ok());
+        updates.push(Update {
+            services: services.clone(),
+            image: shown.clone(),
+            kind: UpdateKind::Tag,
+            current_tag: img.tag.clone(),
+            target_tag: target,
+            current_version: local_version.clone(),
+            new_version: None,
+            severity,
+            breaking: false,
+            auto: rewritable,
+            disabled: false,
+            pull_ref,
+            note: (!rewritable).then(|| {
+                if stack.git_config.is_some() {
+                    "Stack Git : modifier le tag dans le dépôt".to_string()
+                } else {
+                    "Image définie par variable : tag non modifiable".to_string()
+                }
+            }),
+        });
     }
 
     // 2. Same tag, new digest (skip if a same-major tag bump already covers it).

@@ -17,6 +17,8 @@ application/vnd.docker.distribution.manifest.v2+json";
 /// Size caps for registry responses (a hostile registry must not exhaust memory).
 const MANIFEST_MAX: usize = 4 << 20;
 const TAGS_MAX: usize = 16 << 20;
+/// Token responses are a few KB; the realm is chosen by the registry.
+const TOKEN_MAX: usize = 64 << 10;
 
 /// Reads a body up to `max` bytes.
 async fn read_capped(mut resp: Response, max: usize) -> Result<Vec<u8>> {
@@ -31,6 +33,36 @@ async fn read_capped(mut resp: Response, max: usize) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Registries may redirect (blobs to a CDN), but only to HTTPS: tag lists and
+/// HEAD digests are not digest-verified, a downgrade would expose them.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|a| {
+        if a.url().scheme() != "https" {
+            a.error("redirect to a non-HTTPS URL refused")
+        } else if a.previous().len() >= 5 {
+            a.stop()
+        } else {
+            a.follow()
+        }
+    })
+}
+
+/// Bearer token from a token endpoint response (size-capped).
+async fn bearer_token(resp: Response) -> Result<CachedToken> {
+    let body = read_capped(resp, TOKEN_MAX).await?;
+    let t: TokenResponse = serde_json::from_slice(&body).context("decoding token response")?;
+    let value = t
+        .token
+        .or(t.access_token)
+        .context("token endpoint returned no token")?;
+    let ttl = t.expires_in.unwrap_or(60).max(30);
+    Ok(CachedToken {
+        value,
+        scheme: "Bearer",
+        expires: Instant::now() + Duration::from_secs(ttl.saturating_sub(10)),
+    })
 }
 
 fn sha256_hex(body: &[u8]) -> String {
@@ -217,20 +249,34 @@ fn bare_host(h: &str) -> &str {
     h.rsplit_once(':').map_or(h, |(h, _)| h)
 }
 
-/// Last two DNS labels (`registry-1.docker.io` → `docker.io`).
-fn site(h: &str) -> String {
-    let labels: Vec<&str> = h.rsplit('.').take(2).collect();
-    labels.into_iter().rev().collect::<Vec<_>>().join(".")
+/// Registrable domain per the Public Suffix List (`registry-1.docker.io` →
+/// `docker.io`, `reg.example.co.uk` → `example.co.uk`, `a.azurecr.io` →
+/// `a.azurecr.io` via `TENANT_SUFFIXES`). None for IP addresses and bare
+/// public suffixes.
+fn site(h: &str) -> Option<&str> {
+    if h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    // Multi-tenant registry hosts missing from the PSL: each tenant is its own site.
+    if TENANT_SUFFIXES.iter().any(|s| h.strip_suffix(s).is_some_and(|p| p.ends_with('.'))) {
+        return Some(h);
+    }
+    psl::domain_str(h)
 }
 
-/// Credentials go only to the registry itself, a host of the same site
-/// (`auth.docker.io` for `registry-1.docker.io`), or an explicitly allowed realm.
+/// Registry services where anyone can own a subdomain, not listed in the PSL.
+const TENANT_SUFFIXES: &[&str] = &["azurecr.io"];
+
+/// Credentials go only to the registry itself, a host of the same registrable
+/// domain (`auth.docker.io` for `registry-1.docker.io`), or an explicitly
+/// allowed realm. Two tenants of a shared suffix (`co.uk`, `azurecr.io`…) are
+/// not the same site.
 fn realm_trusted(registry: &str, realm_host: &str, extra: &[String]) -> bool {
     let registry = bare_host(registry).to_lowercase();
     let realm = realm_host.to_lowercase();
     realm == registry
-        || (realm.contains('.') && site(&realm) == site(&registry))
-        || extra.iter().any(|e| *e == realm)
+        || site(&realm).is_some_and(|s| Some(s) == site(&registry))
+        || extra.contains(&realm)
 }
 
 impl Registry {
@@ -242,6 +288,8 @@ impl Registry {
         let http = Client::builder()
             .user_agent(concat!("drydock/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
+            .https_only(true)
+            .redirect(redirect_policy())
             .build()?;
         Ok(Self {
             http,
@@ -294,17 +342,7 @@ impl Registry {
             }
         }
         let resp = req.send().await?.error_for_status()?;
-        let t: TokenResponse = resp.json().await?;
-        let value = t
-            .token
-            .or(t.access_token)
-            .context("token endpoint returned no token")?;
-        let ttl = t.expires_in.unwrap_or(60).max(30);
-        Ok(CachedToken {
-            value,
-            scheme: "Bearer",
-            expires: Instant::now() + Duration::from_secs(ttl.saturating_sub(10)),
-        })
+        bearer_token(resp).await
     }
 
     /// Request with automatic token negotiation.
@@ -497,7 +535,7 @@ mod tests {
         let r = Registry::new(HashMap::new(), vec![], vec![]).unwrap();
         // Nothing listening.
         let img = ImageRef::parse("127.0.0.1:1/app:1").unwrap();
-        let e = r.tag_digest(&img).await.err().expect("must fail");
+        let e = r.tag_digest(&img).await.expect_err("must fail");
         assert!(is_unreachable(&e), "{e:#}");
         // Plain-HTTP registry: the TLS handshake fails.
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -511,7 +549,7 @@ mod tests {
             }
         });
         let img = ImageRef::parse(&format!("127.0.0.1:{port}/app:1")).unwrap();
-        let e = r.tag_digest(&img).await.err().expect("must fail");
+        let e = r.tag_digest(&img).await.expect_err("must fail");
         assert!(is_unreachable(&e), "{e:#}");
         // An HTTP answer is not "unreachable".
         let e = anyhow::anyhow!("registry-1.docker.io/x: accès refusé");
@@ -541,7 +579,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let r = Registry::new(HashMap::new(), vec![], vec!["ghcr.io".into()]).unwrap();
         let img = ImageRef::parse("internal.example:5000/app:1").unwrap();
-        let err = r.list_tags(&img).await.err().expect("must be refused");
+        let err = r.list_tags(&img).await.expect_err("must be refused");
         assert!(err.to_string().contains("REGISTRY_ALLOWLIST"), "{err}");
     }
 
@@ -554,6 +592,91 @@ mod tests {
         assert!(!realm_trusted("registry-1.docker.io", "docker.io.evil.example", &[]));
         assert!(!realm_trusted("lscr.io", "ghcr.io", &[]));
         assert!(realm_trusted("lscr.io", "ghcr.io", &["ghcr.io".to_string()]));
+        // Shared public suffixes: other tenants are not the same site.
+        assert!(!realm_trusted("reg.example.co.uk", "evil.co.uk", &[]));
+        assert!(realm_trusted("reg.example.co.uk", "auth.example.co.uk", &[]));
+        assert!(!realm_trusted("a.azurecr.io", "b.azurecr.io", &[]));
+        assert!(realm_trusted("a.azurecr.io", "a.azurecr.io", &[]));
+        assert!(!realm_trusted("user.github.io", "attacker.github.io", &[]));
+        // IP registries: exact host only.
+        assert!(!realm_trusted("10.0.0.5:5000", "10.0.0.6", &[]));
+        assert!(realm_trusted("10.0.0.5:5000", "10.0.0.5", &[]));
+    }
+
+    /// One-shot local HTTP server answering every request with `body`.
+    fn serve_once(body: Vec<u8>, chunked: bool) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Some(mut c) = l.incoming().flatten().next() {
+                let mut b = [0u8; 1024];
+                let _ = c.read(&mut b);
+                if chunked {
+                    // No Content-Length: the cap must hold while streaming.
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    for part in body.chunks(8192) {
+                        let _ = c.write_all(format!("{:x}\r\n", part.len()).as_bytes());
+                        let _ = c.write_all(part);
+                        let _ = c.write_all(b"\r\n");
+                    }
+                    let _ = c.write_all(b"0\r\n\r\n");
+                } else {
+                    let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes());
+                    let _ = c.write_all(&body);
+                }
+            }
+        });
+        format!("http://{addr}/token")
+    }
+
+    /// Local HTTP server answering every request with a redirect to `to(port)`.
+    fn redirect_server(to: impl Fn(u16) -> String + Send + 'static) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut c in l.incoming().flatten() {
+                let mut b = [0u8; 1024];
+                let _ = c.read(&mut b);
+                let resp = format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n", to(port));
+                let _ = c.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}/start")
+    }
+
+    #[tokio::test]
+    async fn redirects_only_to_https() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The policy alone (the real client is also https_only, so it could
+        // not even reach this plain-HTTP test server).
+        let http = Client::builder().redirect(redirect_policy()).build().unwrap();
+        let e = http.get(redirect_server(|p| format!("http://127.0.0.1:{p}/next"))).send().await.unwrap_err();
+        assert!(e.is_redirect() && format!("{e:?}").contains("non-HTTPS"), "{e:?}");
+        // An HTTPS target is followed (here it then fails to connect).
+        let e = http.get(redirect_server(|_| "https://127.0.0.1:1/blob".into())).send().await.unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        // The registry client refuses plain HTTP outright.
+        let r = Registry::new(HashMap::new(), vec![], vec![]).unwrap();
+        assert!(r.http.get("http://127.0.0.1:1/").send().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn token_response_is_capped() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = Client::new();
+        // Normal token.
+        let url = serve_once(br#"{"token":"abc","expires_in":300}"#.to_vec(), false);
+        let t = bearer_token(http.get(url).send().await.unwrap()).await.unwrap();
+        assert_eq!((t.value.as_str(), t.scheme), ("abc", "Bearer"));
+        // 1 MiB token, announced or streamed: refused before being buffered.
+        let huge = format!(r#"{{"token":"{}"}}"#, "a".repeat(1 << 20)).into_bytes();
+        for chunked in [false, true] {
+            let url = serve_once(huge.clone(), chunked);
+            let e = bearer_token(http.get(url).send().await.unwrap()).await.err().expect("must fail");
+            assert!(e.to_string().contains("too large"), "chunked={chunked}: {e}");
+        }
     }
 
     #[tokio::test]

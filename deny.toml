@@ -1,0 +1,48 @@
+# cargo deny check: advisories, licenses, banned/duplicate crates, sources.
+# Run in CI (.github/workflows/security.yml) next to cargo audit.
+
+[graph]
+# The image targets linux musl (amd64 + arm64); other platforms' crates
+# (windows-sys…) do not ship and are not checked.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+
+[advisories]
+# RustSec advisories: vulnerable, unmaintained and unsound crates fail the check.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses only (what the dependency tree uses today). A new
+# license (GPL, MPL…) fails the check until it is reviewed and added here.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[licenses.private]
+# Drydock itself (publish = false) has no license field.
+ignore = true
+
+[bans]
+# Two versions of the same crate are tolerated (ecosystem transitions), but listed.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io: no git dependency or other registry can slip into Cargo.lock.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

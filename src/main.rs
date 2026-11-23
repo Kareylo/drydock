@@ -74,7 +74,7 @@ pub async fn scan(state: Arc<AppState>) {
             .buffer_unordered(4)
             .collect()
             .await;
-        reports.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        reports.sort_by_key(|a| a.name.to_lowercase());
         Ok(reports)
     }
     .await;
@@ -218,14 +218,14 @@ async fn main() -> Result<()> {
     if let Err(e) = state.portainer.ping().await {
         tracing::warn!("Portainer not reachable yet: {e:#}");
     }
-    if let Some(p) = &state.cfg.pangolin {
-        if p.org_id.is_none() {
-            tracing::warn!(
-                "PANGOLIN_ORG_ID absent : pas de correspondance par le label `{}`, seules les ressources du label `{}` passeront en maintenance",
-                state.cfg.url_label,
-                state.cfg.resource_label
-            );
-        }
+    if let Some(p) = &state.cfg.pangolin
+        && p.org_id.is_none()
+    {
+        tracing::warn!(
+            "PANGOLIN_ORG_ID absent : pas de correspondance par le label `{}`, seules les ressources du label `{}` passeront en maintenance",
+            state.cfg.url_label,
+            state.cfg.resource_label
+        );
     }
 
     // Initial scan, then periodic scans.

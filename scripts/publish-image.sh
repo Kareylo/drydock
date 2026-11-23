@@ -10,6 +10,11 @@
 # Trivy scans the image of this machine first: a fixable critical or high
 # vulnerability stops the script before anything is pushed. The image is built
 # FROM scratch: Trivy reads the dependency list cargo-auditable embeds in the binary.
+# The commit must carry the git tag being published, pushed to origin
+# (`git tag -a v1.2.0 -m v1.2.0 && git push origin v1.2.0`).
+# The pushed image is signed with cosign and gets an SPDX SBOM attestation
+# (syft). Signing is keyless by default (a browser opens for the Sigstore
+# login); set COSIGN_KEY to sign with a key instead (cosign.key, kms://…).
 set -euo pipefail
 
 readonly REPOSITORY=docker.io/kareylo/drydock
@@ -24,15 +29,30 @@ major="${BASH_REMATCH[2]}"
 minor="${BASH_REMATCH[3]}"
 tags=("$version" "${prefix}v${major}.${minor}" "${prefix}v${major}" "${prefix}latest")
 
-if ! command -v trivy >/dev/null 2>&1; then
-    echo "Trivy is needed to scan the image before it is pushed: install trivy first." >&2
-    exit 1
-fi
+for tool in trivy cosign syft; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "${tool} is needed (scan, signature, SBOM): install it first." >&2
+        exit 1
+    fi
+done
 
 cd "$(dirname "$0")/.."
 
 if [ -n "$(git status --porcelain)" ]; then
     echo "There are uncommitted changes: commit or stash them, the image must match a commit." >&2
+    exit 1
+fi
+
+# The image must match a release anyone can find: HEAD carries the tag, and
+# origin has the same tag on the same commit.
+if ! git tag --points-at HEAD | grep -qxF "$version"; then
+    echo "HEAD is not tagged ${version}: run git tag -a ${version} -m ${version} first." >&2
+    exit 1
+fi
+head_commit="$(git rev-parse HEAD)"
+remote_commit="$(git ls-remote --tags origin "refs/tags/${version}^{}" "refs/tags/${version}" | awk 'END { print $1 }')"
+if [ "$remote_commit" != "$head_commit" ]; then
+    echo "Tag ${version} is not on origin, or points elsewhere: run git push origin ${version} first." >&2
     exit 1
 fi
 
@@ -50,6 +70,22 @@ scan_image() {
     "$engine" save --output "${scan_dir}/image.tar" "$image"
     trivy image --input "${scan_dir}/image.tar" --scanners vuln \
         --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1
+    # SBOM of the scanned build: same commit and Cargo.lock as the pushed
+    # images (the dependency list is the same for amd64 and arm64).
+    syft "docker-archive:${scan_dir}/image.tar" --output "spdx-json=${scan_dir}/sbom.spdx.json"
+}
+
+# Signs the pushed index (covers every tag and platform) and attaches the SBOM.
+sign_image() {
+    local ref="${REPOSITORY}@$1"
+    local key_flags=()
+    if [ -n "${COSIGN_KEY:-}" ]; then
+        key_flags=(--key "$COSIGN_KEY")
+    fi
+    cosign sign --yes "${key_flags[@]}" "$ref"
+    cosign attest --yes "${key_flags[@]}" --type spdxjson \
+        --predicate "${scan_dir}/sbom.spdx.json" "$ref"
+    echo "Signed ${ref}"
 }
 
 publish_with_podman() {
@@ -75,8 +111,11 @@ publish_with_podman() {
 
     local tag
     for tag in "${tags[@]}"; do
-        podman manifest push --all --format v2s2 "$manifest" "docker://${REPOSITORY}:${tag}"
+        podman manifest push --all --format v2s2 --digestfile "${scan_dir}/digest" \
+            "$manifest" "docker://${REPOSITORY}:${tag}"
     done
+    # Every tag points to the same index: one signature covers them all.
+    sign_image "$(cat "${scan_dir}/digest")"
 }
 
 publish_with_docker() {
@@ -104,6 +143,8 @@ publish_with_docker() {
         "${tag_flags[@]}" \
         --push \
         .
+
+    sign_image "$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${REPOSITORY}:${version}")"
 }
 
 # podman first: on some machines, docker is only a podman shim.

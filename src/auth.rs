@@ -4,6 +4,9 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use hmac::{Hmac, KeyInit, Mac};
+use jsonwebtoken::jwk::{Jwk, PublicKeyUse};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,11 +19,13 @@ use tokio::sync::Mutex;
 pub const MIN_PROXY_SECRET_CHARS: usize = 24;
 /// A login must complete within this delay.
 const LOGIN_TTL: Duration = Duration::from_secs(600);
-/// Caps on in-memory state (pending logins, sessions).
-const MAX_PENDING: usize = 1000;
+/// Cap on in-memory sessions (only authorized users can open one).
 const MAX_SESSIONS: usize = 1000;
-pub const SESSION_COOKIE: &str = "drydock_session";
-pub const STATE_COOKIE: &str = "drydock_oidc_state";
+/// Over HTTPS the session cookie is `__Host-` prefixed (Secure, `Path=/`, no
+/// `Domain`): a sibling subdomain cannot set or overwrite it.
+const SESSION_COOKIE: &str = "drydock_session";
+/// Over HTTPS `__Secure-` prefixed (`Path=/auth` rules out `__Host-`).
+const STATE_COOKIE: &str = "drydock_oidc_state";
 
 #[derive(Clone)]
 pub enum AuthConfig {
@@ -96,7 +101,7 @@ pub fn check_proxy(
     }
     match &p.user_header {
         Some(_) => match user.map(str::trim).filter(|u| !u.is_empty()) {
-            Some(u) => Ok(u.to_string()),
+            Some(u) => Ok(clean_user_name(u)),
             None => Err("en-tête utilisateur absent"),
         },
         None => Ok(user.map(str::trim).filter(|u| !u.is_empty()).unwrap_or("proxy").to_string()),
@@ -175,6 +180,14 @@ impl OidcConfig {
     pub fn secure_cookies(&self) -> bool {
         self.redirect_url.starts_with("https://")
     }
+
+    pub fn session_cookie(&self) -> &'static str {
+        if self.secure_cookies() { "__Host-drydock_session" } else { SESSION_COOKIE }
+    }
+
+    pub fn state_cookie(&self) -> &'static str {
+        if self.secure_cookies() { "__Secure-drydock_oidc_state" } else { STATE_COOKIE }
+    }
 }
 
 /// `https://`, or `http://` on a loopback host (local tests only).
@@ -193,13 +206,39 @@ pub struct Discovery {
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
+    /// Provider signing keys (required by OIDC Discovery).
+    pub jwks_uri: String,
 }
 
+/// Asymmetric algorithms accepted for ID tokens: never `none`, never HMAC
+/// (a provider key published in the JWKS must not double as a shared secret).
+const ID_TOKEN_ALGS: &[Algorithm] = &[
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::EdDSA,
+];
+/// Largest JWKS document read.
+const JWKS_MAX: usize = 256 << 10;
+/// An unknown `kid` refetches the JWKS (key rotation) at most this often.
+const JWKS_REFRESH: Duration = Duration::from_secs(60);
+
+/// A login in progress, carried by the browser in the state cookie (sealed
+/// with `Oidc::key`): Drydock keeps no server-side table that anonymous
+/// `/auth/login` calls could fill up.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
+    state: String,
     nonce: String,
     verifier: String,
-    created: Instant,
 }
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct Session {
@@ -212,7 +251,11 @@ pub struct Oidc {
     pub cfg: OidcConfig,
     http: reqwest::Client,
     discovery: Mutex<Option<Discovery>>,
-    pending: Mutex<HashMap<String, Pending>>,
+    /// Provider signing keys and when they were fetched.
+    jwks: Mutex<Option<(Vec<Jwk>, Instant)>>,
+    /// Seals the state cookie; random per process (a restart only cancels
+    /// the logins in progress).
+    key: [u8; 32],
     sessions: Mutex<HashMap<String, Session>>,
 }
 
@@ -224,14 +267,17 @@ pub struct Identity {
 
 impl Oidc {
     pub fn new(cfg: OidcConfig) -> Result<Self> {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|e| anyhow::anyhow!("OS random generator: {e}"))?;
         Ok(Self {
+            key,
             cfg,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             discovery: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            jwks: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -252,52 +298,70 @@ impl Oidc {
         }
         check_url_scheme("authorization_endpoint", &d.authorization_endpoint)?;
         check_url_scheme("token_endpoint", &d.token_endpoint)?;
+        check_url_scheme("jwks_uri", &d.jwks_uri)?;
         *self.discovery.lock().await = Some(d.clone());
         Ok(d)
     }
 
-    /// Starts a login: returns the provider URL to redirect to and the `state`
-    /// value, also set in a cookie to bind the callback to this browser.
+    fn mac(&self, payload: &str) -> HmacSha256 {
+        let mut m = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key size");
+        m.update(payload.as_bytes());
+        m
+    }
+
+    /// `state.nonce.verifier.created.mac` (base64url tokens contain no `.`).
+    fn seal(&self, p: &Pending, created: u64) -> String {
+        let payload = format!("{}.{}.{}.{created}", p.state, p.nonce, p.verifier);
+        let mac = URL_SAFE_NO_PAD.encode(self.mac(&payload).finalize().into_bytes());
+        format!("{payload}.{mac}")
+    }
+
+    /// The login sealed in `cookie`, if authentic and not older than `LOGIN_TTL`.
+    fn open(&self, cookie: &str, now: u64) -> Option<Pending> {
+        let (payload, mac) = cookie.rsplit_once('.')?;
+        self.mac(payload).verify_slice(&URL_SAFE_NO_PAD.decode(mac).ok()?).ok()?;
+        let mut parts = payload.split('.');
+        let (state, nonce, verifier, created) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let created: u64 = created.parse().ok()?;
+        if created > now + 60 || now.saturating_sub(created) >= LOGIN_TTL.as_secs() {
+            return None;
+        }
+        Some(Pending { state: state.into(), nonce: nonce.into(), verifier: verifier.into() })
+    }
+
+    /// Starts a login: returns the provider URL to redirect to and the sealed
+    /// login, to set in the state cookie (binds the callback to this browser).
     pub async fn begin_login(&self) -> Result<(String, String)> {
         let d = self.discovery().await?;
-        let state = random_token();
-        let nonce = random_token();
-        let verifier = random_token();
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        {
-            let mut pending = self.pending.lock().await;
-            pending.retain(|_, p| p.created.elapsed() < LOGIN_TTL);
-            if pending.len() >= MAX_PENDING {
-                bail!("too many logins in progress, retry later");
-            }
-            pending.insert(state.clone(), Pending { nonce: nonce.clone(), verifier, created: Instant::now() });
-        }
+        let pending = Pending { state: random_token(), nonce: random_token(), verifier: random_token() };
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pending.verifier.as_bytes()));
+        let (state, nonce) = (&pending.state, &pending.nonce);
         let mut url = reqwest::Url::parse(&d.authorization_endpoint)?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.cfg.client_id)
             .append_pair("redirect_uri", &self.cfg.redirect_url)
             .append_pair("scope", &self.cfg.scopes)
-            .append_pair("state", &state)
-            .append_pair("nonce", &nonce)
+            .append_pair("state", state)
+            .append_pair("nonce", nonce)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
-        Ok((url.to_string(), state))
+        Ok((url.to_string(), self.seal(&pending, now_secs())))
     }
 
-    /// Completes a login: checks `state` against the cookie, exchanges the code
-    /// and validates the ID token. Returns the new session id.
-    pub async fn finish_login(&self, state: &str, cookie_state: Option<&str>, code: &str) -> Result<(String, String)> {
-        if !cookie_state.is_some_and(|c| constant_time_eq(c, state)) {
+    /// Completes a login: opens the state cookie, checks `state` against it,
+    /// exchanges the code and validates the ID token. Returns the new session id.
+    /// A replayed cookie is harmless: the provider accepts each code only once.
+    pub async fn finish_login(&self, state: &str, cookie: Option<&str>, code: &str) -> Result<(String, String)> {
+        let pending = cookie
+            .and_then(|c| self.open(c, now_secs()))
+            .context("unknown or expired login")?;
+        if !constant_time_eq(&pending.state, state) {
             bail!("state does not match this browser's login");
         }
-        let pending = self
-            .pending
-            .lock()
-            .await
-            .remove(state)
-            .filter(|p| p.created.elapsed() < LOGIN_TTL)
-            .context("unknown or expired login")?;
         let d = self.discovery().await?;
         let resp = self
             .http
@@ -319,10 +383,9 @@ impl Oidc {
             bail!("token endpoint: HTTP {status} {err}");
         }
         let id_token = body.get("id_token").and_then(Value::as_str).context("no id_token in the token response")?;
-        // The ID token comes straight from the token endpoint over TLS (or
-        // loopback), authenticated with the client secret: per OIDC Core
-        // 3.1.3.7, TLS server validation replaces the signature check here.
-        let claims = decode_jwt_payload(id_token)?;
+        // Signature checked against the provider's JWKS, on top of TLS to the
+        // token endpoint: neither alone is a single point of failure.
+        let claims = self.verify_id_token(&d.jwks_uri, id_token).await?;
         let identity = validate_claims(&self.cfg, &claims, &pending.nonce, now_secs())?;
 
         let session_id = random_token();
@@ -336,6 +399,64 @@ impl Oidc {
             Session { user: identity.user.clone(), expires: Instant::now() + self.cfg.session_ttl },
         );
         Ok((session_id, identity.user))
+    }
+
+    /// Downloads the provider's JWKS (size-capped). Keys Drydock cannot parse
+    /// (other key types, encryption keys…) are skipped, not fatal.
+    async fn fetch_jwks(&self, uri: &str) -> Result<Vec<Jwk>> {
+        let mut resp = self.http.get(uri).send().await.with_context(|| format!("GET {uri}"))?;
+        if !resp.status().is_success() {
+            bail!("GET {uri}: HTTP {}", resp.status());
+        }
+        let mut raw = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            raw.extend_from_slice(&chunk);
+            if raw.len() > JWKS_MAX {
+                bail!("GET {uri}: JWKS larger than {JWKS_MAX} bytes");
+            }
+        }
+        let set: Value = serde_json::from_slice(&raw).context("decoding the provider JWKS")?;
+        let keys: Vec<Jwk> = set
+            .get("keys")
+            .and_then(Value::as_array)
+            .context("JWKS without keys")?
+            .iter()
+            .filter_map(|k| serde_json::from_value(k.clone()).ok())
+            .collect();
+        Ok(keys)
+    }
+
+    /// Signing keys that may have produced a token with this `kid`. An
+    /// unknown `kid` refetches the JWKS once per `JWKS_REFRESH` (key rotation).
+    async fn signing_keys(&self, uri: &str, kid: Option<&str>) -> Result<Vec<Jwk>> {
+        let mut cache = self.jwks.lock().await;
+        let known = |keys: &[Jwk]| kid.is_none_or(|k| keys.iter().any(|j| j.common.key_id.as_deref() == Some(k)));
+        let stale = match &*cache {
+            None => true,
+            Some((keys, at)) => !known(keys) && at.elapsed() >= JWKS_REFRESH,
+        };
+        if stale {
+            *cache = Some((self.fetch_jwks(uri).await?, Instant::now()));
+        }
+        let keys = cache.as_ref().map(|(k, _)| k.as_slice()).unwrap_or_default();
+        Ok(keys
+            .iter()
+            .filter(|j| kid.is_none_or(|k| j.common.key_id.as_deref() == Some(k)))
+            .filter(|j| !matches!(j.common.public_key_use, Some(ref u) if *u != PublicKeyUse::Signature))
+            .cloned()
+            .collect())
+    }
+
+    /// Claims of an ID token whose signature one of the provider's keys
+    /// verifies. Issuer, audience, expiry and nonce are checked afterwards by
+    /// `validate_claims`.
+    async fn verify_id_token(&self, jwks_uri: &str, id_token: &str) -> Result<Value> {
+        let header = jsonwebtoken::decode_header(id_token).context("malformed ID token")?;
+        if !ID_TOKEN_ALGS.contains(&header.alg) {
+            bail!("ID token signed with {:?}: algorithm refused", header.alg);
+        }
+        let keys = self.signing_keys(jwks_uri, header.kid.as_deref()).await?;
+        verify_with_keys(id_token, header.alg, &keys)
     }
 
     pub async fn session(&self, id: &str) -> Option<Session> {
@@ -385,7 +506,7 @@ pub fn validate_claims(cfg: &OidcConfig, c: &Value, nonce: &str, now: u64) -> Re
     let sub = s("sub").context("ID token without sub")?;
     let username = s("preferred_username");
     let email = s("email");
-    let user = username.or(email).unwrap_or(sub).to_string();
+    let user = clean_user_name(username.or(email).unwrap_or(sub));
 
     if !cfg.allowed_users.is_empty() || !cfg.allowed_groups.is_empty() {
         let names: Vec<String> = [Some(sub), username, email].into_iter().flatten().map(str::to_lowercase).collect();
@@ -403,6 +524,29 @@ pub fn validate_claims(cfg: &OidcConfig, c: &Value, nonce: &str, now: u64) -> Re
     Ok(Identity { user })
 }
 
+/// Verifies the signature of `id_token` (signed with `alg`) with the first
+/// matching key; returns its claims. Only the signature is checked here.
+fn verify_with_keys(id_token: &str, alg: Algorithm, keys: &[Jwk]) -> Result<Value> {
+    let mut v = Validation::new(alg);
+    v.validate_exp = false;
+    v.validate_nbf = false;
+    v.validate_aud = false;
+    v.required_spec_claims.clear();
+    let alg_name = serde_json::to_value(alg).ok();
+    for jwk in keys {
+        // A key bound to another algorithm is not tried.
+        if jwk.common.key_algorithm.as_ref().is_some_and(|a| serde_json::to_value(a).ok() != alg_name) {
+            continue;
+        }
+        let Ok(key) = DecodingKey::from_jwk(jwk) else { continue };
+        if let Ok(t) = jsonwebtoken::decode::<Value>(id_token, &key, &v) {
+            return Ok(t.claims);
+        }
+    }
+    bail!("ID token signature not verified by any of the provider's keys")
+}
+
+#[cfg(test)]
 fn decode_jwt_payload(jwt: &str) -> Result<Value> {
     let mut parts = jwt.split('.');
     let (Some(_), Some(payload), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
@@ -420,6 +564,13 @@ fn form_encode(s: &str) -> String {
     reqwest::Url::parse_with_params("x:", &[("v", s)])
         .map(|u| u.query().unwrap_or("v=").trim_start_matches("v=").to_string())
         .unwrap_or_else(|_| s.to_string())
+}
+
+/// User name safe to log and display: no control characters (newlines would
+/// forge log lines), 128 chars at most. Applied where a name enters Drydock
+/// (ID token claim, proxy header), so every later use is safe.
+pub fn clean_user_name(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(128).collect()
 }
 
 /// 256-bit random token, base64url.
@@ -490,6 +641,16 @@ mod tests {
     }
 
     #[test]
+    fn user_names_are_cleaned() {
+        let mut c = claims();
+        c["preferred_username"] = json!("a\nINFO forged\r\u{1b}[31m");
+        let user = validate_claims(&oidc(), &c, "n1", 1500).unwrap().user;
+        assert_eq!(user, "aINFO forged[31m");
+        assert_eq!(clean_user_name(&"x".repeat(500)).chars().count(), 128);
+        assert_eq!(clean_user_name("élodie.dupont@example.com"), "élodie.dupont@example.com");
+    }
+
+    #[test]
     fn claims_rejected() {
         let cfg = oidc();
         let mut c = claims();
@@ -549,10 +710,162 @@ mod tests {
         assert!(Cidr::parse("0.0.0.0/0").unwrap().contains("8.8.8.8".parse().unwrap()));
     }
 
+    fn client() -> Oidc {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Oidc::new(oidc()).unwrap()
+    }
+
+    fn pending() -> Pending {
+        Pending { state: random_token(), nonce: random_token(), verifier: random_token() }
+    }
+
+    #[test]
+    fn sealed_login_round_trip() {
+        let o = client();
+        let p = pending();
+        let c = o.seal(&p, 1000);
+        assert_eq!(o.open(&c, 1000), Some(p.clone()));
+        assert_eq!(o.open(&c, 1000 + LOGIN_TTL.as_secs() - 1), Some(p.clone()));
+    }
+
+    #[test]
+    fn sealed_login_rejected() {
+        let o = client();
+        let c = o.seal(&pending(), 1000);
+        // Expired, or dated in the future.
+        assert_eq!(o.open(&c, 1000 + LOGIN_TTL.as_secs()), None);
+        assert_eq!(o.open(&c, 900), None);
+        // Any byte changed (payload or MAC).
+        for i in [0, c.len() / 2, c.len() - 1] {
+            let mut b = c.clone().into_bytes();
+            b[i] = if b[i] == b'A' { b'B' } else { b'A' };
+            assert_eq!(o.open(&String::from_utf8(b).unwrap(), 1000), None, "byte {i}");
+        }
+        // Another process (key) did not seal it.
+        assert_eq!(client().open(&c, 1000), None);
+        // Extra or missing fields, garbage.
+        assert_eq!(o.open("a.b.c", 1000), None);
+        assert_eq!(o.open("", 1000), None);
+    }
+
+    // Throwaway Ed25519 test keys (PKCS#8 DER, base64) and their public `x`.
+    const ED1_DER: &str = "MC4CAQAwBQYDK2VwBCIEIEgAgCtZqZ5vHJZmuczLtZt1CNxmsAJGLvf/gAZ66WfL";
+    const ED1_X: &str = "1tvX28nafZ0b1szf1WipYqN-yuuG6-W8UrBVGDmMig8";
+    const ED2_X: &str = "mpYao3QLtHgDwTLJQKkWEZuGM25n-jcjLxuNjnFbMqI";
+
+    fn jwk(kid: &str, x: &str, extra: Value) -> Jwk {
+        let mut j = json!({"kty": "OKP", "crv": "Ed25519", "x": x, "kid": kid});
+        j.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(j).unwrap()
+    }
+
+    fn signed(kid: &str, claims: &Value) -> String {
+        let der = base64::engine::general_purpose::STANDARD.decode(ED1_DER).unwrap();
+        let mut h = jsonwebtoken::Header::new(Algorithm::EdDSA);
+        h.kid = Some(kid.into());
+        jsonwebtoken::encode(&h, claims, &jsonwebtoken::EncodingKey::from_ed_der(&der)).unwrap()
+    }
+
+    #[test]
+    fn id_token_signature() {
+        let t = signed("k1", &claims());
+        let good = jwk("k1", ED1_X, json!({"alg": "EdDSA", "use": "sig"}));
+        assert_eq!(verify_with_keys(&t, Algorithm::EdDSA, std::slice::from_ref(&good)).unwrap()["sub"], "u-1");
+        // Another key, or no key at all.
+        assert!(verify_with_keys(&t, Algorithm::EdDSA, &[jwk("k1", ED2_X, json!({}))]).is_err());
+        assert!(verify_with_keys(&t, Algorithm::EdDSA, &[]).is_err());
+        // The right key, but bound to another algorithm.
+        assert!(verify_with_keys(&t, Algorithm::EdDSA, &[jwk("k1", ED1_X, json!({"alg": "RS256"}))]).is_err());
+        // Payload swapped after signing (e.g. another user).
+        let mut parts: Vec<&str> = t.split('.').collect();
+        let forged = URL_SAFE_NO_PAD.encode(json!({"sub": "admin"}).to_string());
+        parts[1] = &forged;
+        assert!(verify_with_keys(&parts.join("."), Algorithm::EdDSA, &[good]).is_err());
+    }
+
+    #[tokio::test]
+    async fn id_token_algorithms_refused() {
+        let o = client();
+        // Unreachable JWKS: refused before any key is needed.
+        let uri = "https://127.0.0.1:1/jwks";
+        let hs = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &claims(),
+            &jsonwebtoken::EncodingKey::from_secret(b"secret").unwrap(),
+        )
+        .unwrap();
+        let e = o.verify_id_token(uri, &hs).await.unwrap_err();
+        assert!(e.to_string().contains("algorithm refused"), "{e:#}");
+        let none = format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD.encode(claims().to_string())
+        );
+        assert!(o.verify_id_token(uri, &none).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn signing_keys_cache_and_filters() {
+        let o = client();
+        let keys = vec![
+            jwk("k1", ED1_X, json!({"use": "sig"})),
+            jwk("k2", ED2_X, json!({"use": "enc"})),
+        ];
+        *o.jwks.lock().await = Some((keys, Instant::now()));
+        let uri = "https://127.0.0.1:1/jwks"; // must not be fetched
+        assert_eq!(o.signing_keys(uri, Some("k1")).await.unwrap().len(), 1);
+        // Encryption key never used to verify signatures.
+        assert!(o.signing_keys(uri, Some("k2")).await.unwrap().is_empty());
+        // Unknown kid on a fresh cache: no refetch storm, just no key.
+        assert!(o.signing_keys(uri, Some("k9")).await.unwrap().is_empty());
+        // End to end with the cached key.
+        let c = o.verify_id_token(uri, &signed("k1", &claims())).await.unwrap();
+        assert_eq!(c["preferred_username"], "alice");
+    }
+
+    #[tokio::test]
+    async fn jwks_download() {
+        let o = client();
+        let serve = |body: Vec<u8>| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                if let Some(mut c) = l.incoming().flatten().next() {
+                    let mut b = [0u8; 1024];
+                    let _ = c.read(&mut b);
+                    let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes());
+                    let _ = c.write_all(&body);
+                }
+            });
+            format!("http://{addr}/jwks")
+        };
+        // Unparseable keys are skipped, not fatal.
+        let set = json!({"keys": [{"kty": "OKP", "kid": 5}, {"kty": "OKP", "crv": "Ed25519", "x": ED1_X, "kid": "k1"}]});
+        let keys = o.fetch_jwks(&serve(set.to_string().into_bytes())).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        // Oversized JWKS refused.
+        let huge = format!(r#"{{"keys":[],"pad":"{}"}}"#, "a".repeat(JWKS_MAX));
+        let e = o.fetch_jwks(&serve(huge.into_bytes())).await.unwrap_err();
+        assert!(e.to_string().contains("larger than"), "{e:#}");
+    }
+
     #[test]
     fn cookies_and_encoding() {
         assert_eq!(cookie(Some("a=1; drydock_session=abc; b=2"), SESSION_COOKIE), Some("abc"));
         assert_eq!(cookie(None, SESSION_COOKIE), None);
+        // HTTPS: prefixed names, and the unprefixed cookie is not accepted for them.
+        let cfg = oidc();
+        assert_eq!(cfg.session_cookie(), "__Host-drydock_session");
+        assert_eq!(cfg.state_cookie(), "__Secure-drydock_oidc_state");
+        assert_eq!(cookie(Some("drydock_session=forged"), cfg.session_cookie()), None);
+        let c = set_cookie(cfg.session_cookie(), "v", "/", 60, cfg.secure_cookies());
+        assert!(c.contains("; Secure") && c.contains("Path=/;") && !c.contains("Domain"), "{c}");
+        // Plain HTTP on loopback (local tests): unprefixed, the browser would drop prefixed ones.
+        let mut local = oidc();
+        local.redirect_url = "http://localhost:8080/auth/callback".into();
+        assert_eq!(local.session_cookie(), SESSION_COOKIE);
+        assert_eq!(local.state_cookie(), STATE_COOKIE);
         assert_eq!(form_encode("a b:c&d"), "a+b%3Ac%26d");
         assert_eq!(decode_jwt_payload("x.eyJhIjoxfQ.y").unwrap()["a"], 1);
         assert_ne!(random_token(), random_token());

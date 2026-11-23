@@ -81,6 +81,8 @@ Une image partagée par plusieurs services est mise à jour seulement si **tous*
 | `REGISTRY_ALLOWLIST` | — | registres que Drydock a le droit d'interroger, ex. `docker.io,ghcr.io,lscr.io`. Vide : tous |
 | `AUTH_MODE` | `basic` si `UI_BASIC_AUTH` est défini | `basic`, `proxy`, `oidc` ou `none`. Voir [Authentification](#authentification). Sans mode valide, Drydock refuse de démarrer |
 | `ALLOWED_HOSTS` | — | noms d'hôte acceptés, ex. `drydock.example.com` (protection contre le DNS rebinding). Recommandé avec `AUTH_MODE=none` ou `proxy` |
+| `HSTS` | `true` | envoie `Strict-Transport-Security: max-age=31536000`, ignoré par les navigateurs en HTTP simple. Mettre `false` si le nom de Drydock doit rester joignable en HTTP |
+| `TRUSTED_PROXIES` | — | proxys (adresses ou réseaux, ex. `172.18.0.0/16`) dont l'en-tête `X-Forwarded-For` donne l'adresse du client. Sert à limiter les essais de mot de passe par client en mode `basic`. L'en-tête des autres sources est ignoré |
 | `MAINTENANCE_TITLE` / `MAINTENANCE_MESSAGE` | texte FR | contenu de la page de maintenance |
 | `LISTEN` | `0.0.0.0:8080` | adresse d'écoute |
 | `RUST_LOG` | `drydock=info` | niveau de logs |
@@ -112,6 +114,8 @@ Le proxy authentifie l'utilisateur, puis ajoute à chaque requête vers Drydock 
 ### `oidc` : n'importe quel fournisseur OpenID Connect (Authelia, Authentik, Keycloak…)
 
 Drydock redirige vers le fournisseur (flux *authorization code* avec PKCE), puis ouvre une session : cookie `HttpOnly`, `SameSite=Lax`, et `Secure` en HTTPS.
+
+La signature de l'ID token est vérifiée avec les clés publiées par le fournisseur (`jwks_uri` de sa découverte OIDC). Seuls les algorithmes asymétriques sont acceptés : RS*, PS*, ES256, ES384 et EdDSA. Un fournisseur qui signe en HS256 est refusé.
 
 | Variable | Défaut | Rôle |
 |---|---|---|
@@ -188,15 +192,18 @@ Avec `podman run` sans compose : `--health-cmd '["/drydock","healthcheck"]' --he
 ## Sécurité
 
 - **TLS :** Drydock sert du HTTP simple. Il doit être publié derrière un proxy TLS (Pangolin), jamais exposé directement.
-- **En-têtes :** chaque réponse porte une CSP stricte (seuls le script et le style intégrés à la page sont autorisés, par empreinte), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` et `Cache-Control: no-store`.
-- **Connexion :** un seul mauvais mot de passe est traité à la fois, avec 1 s d'attente. Les autres essais ratés reçoivent immédiatement `429` (`Retry-After: 1`), soit au plus environ un essai raté par seconde. Les échecs sont loggés, avec le nombre d'essais rejetés.
+- **En-têtes :** chaque réponse porte une CSP stricte (seuls le script et le style intégrés à la page sont autorisés, par empreinte), `Strict-Transport-Security` (désactivable avec `HSTS=false`), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` et `Cache-Control: no-store`.
+- **Connexion (`basic`) :** Drydock vérifie au plus 5 mots de passe d'affilée par client, puis 1 par seconde, et au plus 20 puis 2 par seconde tous clients confondus, quel que soit le nombre de requêtes en parallèle. Au-delà, il répond `429` (`Retry-After: 1`) sans vérifier le mot de passe, donc la réponse n'apprend rien sur lui. Un mot de passe correct ne consomme pas ce quota. Un client qui multiplie les échecs ne bloque que lui-même : les autres continuent à se connecter. Derrière un proxy, tous les clients ont l'adresse du proxy : renseigner `TRUSTED_PROXIES` pour que Drydock lise leur vraie adresse dans `X-Forwarded-For`. Une attaque depuis de nombreuses adresses peut encore épuiser le quota global ; pour un Drydock joignable depuis Internet, préférer `AUTH_MODE=oidc` ou `proxy`. Mot de passe conseillé : `openssl rand -base64 18`. Les échecs sont loggés, avec le nombre d'essais rejetés.
+- **Connexion (`oidc`) :** la connexion en cours (state, nonce, verifier PKCE) est scellée par HMAC dans un cookie, sans table côté serveur que des appels anonymes pourraient remplir. La signature de l'ID token est vérifiée avec les clés du fournisseur (JWKS). En HTTPS, les cookies s'appellent `__Host-drydock_session` et `__Secure-drydock_oidc_state`. Les erreurs renvoyées par le fournisseur sont filtrées avant d'être loggées, et l'utilisateur ne voit qu'un message générique.
 - **Clients lents :** une connexion qui n'envoie rien pendant 10 s est fermée, tout comme un client qui n'a pas fini d'envoyer ses en-têtes en 10 s. Drydock ne sert que HTTP/1 (HTTP/2 en clair est refusé). Au-delà de 256 connexions simultanées, les nouvelles sont refusées. À l'arrêt (SIGTERM), les requêtes en cours ont 10 s pour se terminer.
 - **Clés en clair :** un `PORTAINER_URL` ou un `PANGOLIN_URL` en `http://` déclenche un avertissement au démarrage. À réserver à un réseau Docker isolé.
-- **Registres :** les réponses sont plafonnées (4 Mio par manifeste, 16 Mio par liste de tags) et tout contenu demandé par digest est vérifié contre ce digest.
+- **Registres :** HTTPS uniquement, redirections comprises. Les réponses sont plafonnées : 4 Mio par manifeste, 16 Mio par liste de tags, 64 Kio par jeton. Tout contenu demandé par digest est vérifié contre ce digest. Les identifiants de `REGISTRY_AUTH` ne partent que vers le registre lui-même, un hôte du même domaine enregistrable (Public Suffix List), ou un realm de `REGISTRY_AUTH_REALMS`.
+- **Portainer et Pangolin :** le flux de pull est lu ligne par ligne, et les réponses de Pangolin sont plafonnées à 8 Mio.
 - **Conteneur :** [compose.example.yaml](compose.example.yaml) applique `read_only`, `cap_drop: [ALL]`, `no-new-privileges`, des limites mémoire et PID, et passe les clés par des secrets (fichiers).
 - **Image de build :** épinglée par digest dans le `Dockerfile`. Dependabot propose les mises à jour du digest.
 - **Binaire auditable :** compilé avec `cargo auditable`, il embarque la liste de ses dépendances. Trivy et `cargo audit bin` peuvent donc vérifier le binaire livré, pas seulement `Cargo.lock`.
-- **CI** ([.github/workflows/security.yml](.github/workflows/security.yml)) : à chaque push, à chaque pull request et chaque lundi, elle lance les tests, `cargo audit --deny warnings`, le build de l'image, un scan Trivy de l'image et un scan Trivy de la configuration. Une vulnérabilité HIGH ou CRITICAL fait échouer la CI. Les actions sont épinglées par SHA. [Dependabot](.github/dependabot.yml) met à jour chaque semaine les crates, l'image de build et les actions.
+- **CI** ([.github/workflows/security.yml](.github/workflows/security.yml)) : à chaque push, à chaque pull request et chaque lundi, elle lance les tests, `cargo clippy -- -D warnings`, `cargo audit --deny warnings`, `cargo deny check` (licences, sources crates.io uniquement, crates retirées ; voir [deny.toml](deny.toml)), le build de l'image, un scan Trivy de l'image et un scan Trivy de la configuration. Une vulnérabilité HIGH ou CRITICAL fait échouer la CI. Les actions sont épinglées par SHA. [Dependabot](.github/dependabot.yml) met à jour chaque semaine les crates, l'image de build et les actions.
+- **Publication :** [scripts/publish-image.sh](scripts/publish-image.sh) ne publie qu'un tag git présent sur `origin`, signe l'image avec cosign et y attache un SBOM SPDX. Voir [Publier une image](#publier-une-image).
 
 ## Build
 
@@ -212,6 +219,25 @@ podman build --format docker -t drydock .
 cargo test                      # tests unitaires
 cargo test -- --ignored         # tests réseau contre Docker Hub / GHCR
 cargo audit                     # CVE des dépendances (cargo install cargo-audit)
+```
+
+### Publier une image
+
+```bash
+git tag -a v1.2.0 -m v1.2.0 && git push origin v1.2.0
+scripts/publish-image.sh v1.2.0
+```
+
+Le script refuse de publier si le commit courant ne porte pas ce tag, ou si `origin` ne l'a pas. Il scanne l'image avec Trivy, la pousse en amd64 + arm64, la signe avec cosign et y attache un SBOM SPDX (syft). Il faut donc `trivy`, `cosign` et `syft`. La signature est *keyless* par défaut : un navigateur s'ouvre pour la connexion Sigstore. Pour signer avec une clé, définir `COSIGN_KEY` (fichier `cosign.key` ou `kms://…`).
+
+Vérifier une image publiée (signature keyless) :
+
+```bash
+cosign verify docker.io/kareylo/drydock:v1.2.0 \
+  --certificate-identity <e-mail ou identité utilisée pour signer> \
+  --certificate-oidc-issuer <émetteur, ex. https://github.com/login/oauth>
+cosign verify-attestation --type spdxjson docker.io/kareylo/drydock:v1.2.0 \
+  --certificate-identity <…> --certificate-oidc-issuer <…>
 ```
 
 ## API
